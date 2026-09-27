@@ -1,0 +1,3 @@
+#pragma once
+
+#define PREYHFR_VERSION "@PREYHFR_PACKAGE_VERSION@"
