@@ -12,7 +12,7 @@ set(_payload_files
     "PreyHFRHook.dll"
     "PreyHFR.ini"
     "uninstall-preyhfr.cmd"
-    "PreyHFR-README.md"
+    "PreyHFR-README.txt"
     "PreyHFR-LICENSE.txt"
 )
 set(_expected_files ${_payload_files} "PreyHFR-release.json")

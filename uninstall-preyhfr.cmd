@@ -11,7 +11,7 @@ for %%F in (
     "PreyHFR.ini"
     "PreyHFR-release.json"
     "PreyHFR.log"
-    "PreyHFR-README.md"
+    "PreyHFR-README.txt"
     "PreyHFR-LICENSE.txt"
 ) do if exist "%%~F" del /f /q "%%~F"
 

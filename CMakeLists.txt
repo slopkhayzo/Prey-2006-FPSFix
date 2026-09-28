@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PreyHFR VERSION 1.0.1 LANGUAGES CXX)
+project(PreyHFR VERSION 1.0.2 LANGUAGES CXX)
 
 set(PREYHFR_PRERELEASE "")
 if(PREYHFR_PRERELEASE)
@@ -130,7 +130,7 @@ install(FILES
     uninstall-preyhfr.cmd
     DESTINATION .
 )
-install(FILES README.md DESTINATION . RENAME PreyHFR-README.md)
+install(FILES packaging/PreyHFR-README.txt DESTINATION .)
 install(FILES LICENSE DESTINATION . RENAME PreyHFR-LICENSE.txt)
 
 configure_file(

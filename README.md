@@ -43,7 +43,7 @@ signatures are treated as errors.
 
 ## Current status
 
-Version `1.0.1` uses the patch stack that completed a full single-player
+Version `1.0.2` uses the patch stack that completed a full single-player
 playthrough at 360 Hz with
 no major issues observed. It has also been exercised in focused tests at 120,
 144, 165, 240, and 360 Hz across windowed, exclusive, and primary-display
@@ -80,7 +80,7 @@ cmake --build build-x86 --target PreyHFRPackage
 
 The package target stages, hashes, architecture-checks, and validates the exact
 release payload before and after creating
-`build-x86/release/PreyHFR-1.0.1-windows-x86.zip`.
+`build-x86/release/PreyHFR-1.0.2-windows-x86.zip`.
 
 The build never needs the retail game files. They are required only when
 running the launcher against your own installation.
@@ -139,6 +139,7 @@ only PreyHFR files.
 - `src/runtime_dump`: optional developer utility for mapping a personally
   owned retail executable at runtime; generated dumps remain untracked.
 - `cmake`: release manifest generation and package verification.
+- `packaging`: plain-text documentation included in binary releases.
 - `PreyHFR.ini`: documented release defaults.
 
 No retail binaries, SDK source, decompilations, generated dumps, captures, or
