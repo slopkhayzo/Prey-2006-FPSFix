@@ -5,11 +5,9 @@
 > I won't and will never claim to have enough knowledge or expertise to do this 
 > kind of reverse-engineering by myself; I've tested the entire game at 360hz + 
 > briefly tested at 120, 144 and 240 and so far spotted 
-> no major issues (on my machine ofc, if you have issues feel free to open an Issue), 
-> save for frametime & interpolation hiccups upon saving checkpoints or first time loading 
-> (solvable by briefly pausing/unpausing the game, or at most a game reboot if 
-> it's persistent but the latter has happened very rarely to me, once in the entire 
-> playthrough I think) and I am working to fix that too
+> no major issues (on my machine ofc, if you have issues feel free to open an Issue),
+> save for a small issue at first boot in which there could be a persistent
+> frametime/interpolation hitch, a game restart is sufficient to fix it.
 
 PreyHFR is an experimental high-frame-rate presentation fix for the Windows
 Steam release of *Prey* (2006) 1.4. It keeps the original 16 ms (62.5 Hz)
@@ -20,8 +18,10 @@ to restore low input latency.
 
 The patch is a reversible runtime injection. It does not replace or modify
 `prey.exe`, `base/gamex86.dll`, PK4 archives, saves, or other retail files.
-This repository contains no game files: you must supply your own legally
-acquired copy of *Prey*.
+The tracked repository and release packages contain no game files: you must
+supply your own legally acquired copy of *Prey*. A developer may keep private
+retail files and reverse-engineering material under the ignored `research/`
+directory described below; none of it is part of the project or its releases.
 
 > [!IMPORTANT]
 > This is an unofficial runtime patch. Back up saves, test conservatively, and
@@ -43,12 +43,18 @@ signatures are treated as errors.
 
 ## Current status
 
-Version `1.0.2` uses the patch stack that completed a full single-player
-playthrough at 360 Hz with
-no major issues observed. It has also been exercised in focused tests at 120,
-144, 165, 240, and 360 Hz across windowed, exclusive, and primary-display
+Version `1.0.3` adds automatic recovery when a checkpoint or other short stall
+leaves the presentation clock outside its supported interpolation horizon. It
+also provides a configurable, presentation-only emergency reset key, defaulting
+to `F10`. The checkpoint reproducer that previously left interpolation
+permanently clamped recovered on the next snapshot in focused live testing.
+
+The underlying patch stack completed a full single-player playthrough at 360 Hz
+with no major issues observed and has also been exercised in focused tests at
+120, 144, 165, 240, and 360 Hz across windowed, exclusive, and primary-display
 borderless modes. The default configuration enables the complete interpolation
-stack, retains the native simulation rate, and caps presentation at 240 Hz.
+stack, retains the native simulation rate, and detects the desktop refresh rate
+for its presentation cap.
 
 Known limits:
 
@@ -80,7 +86,7 @@ cmake --build build-x86 --target PreyHFRPackage
 
 The package target stages, hashes, architecture-checks, and validates the exact
 release payload before and after creating
-`build-x86/release/PreyHFR-1.0.2-windows-x86.zip`.
+`build-x86/release/PreyHFR-1.0.3-windows-x86.zip`.
 
 The build never needs the retail game files. They are required only when
 running the launcher against your own installation.
@@ -111,6 +117,8 @@ Useful checks and examples:
 PreyHFRLauncher.exe --validate-config
 PreyHFRLauncher.exe --game-dir "C:\Path\To\Prey" --dry-run
 PreyHFRLauncher.exe --game-dir "C:\Path\To\Prey" --fps 144 --borderless
+PreyHFRLauncher.exe --interpolation-trace
+PreyHFRLauncher.exe --timeline-reset-key F10
 PreyHFRLauncher.exe --game-dir "C:\Path\To\Prey" --disabled
 PreyHFRLauncher.exe --help
 ```
@@ -126,9 +134,23 @@ if V-Sync or an external limiter owns pacing; avoid running two active
 limiters. Every interpolation layer has an independent diagnostic toggle.
 
 `PreyHFR.log` is written beside the launcher. Include it when reporting an
-issue. Clean shutdown restores all temporary hooks and window state. To remove
-a packaged copy, close the game and run `uninstall-preyhfr.cmd`; it removes
-only PreyHFR files.
+issue. For a repeatable interpolation problem, enable
+`diagnostics.interpolation_trace` in the INI (or pass
+`--interpolation-trace`). This adds one structured `interp_trace` record per
+gameplay presentation, including the camera clock, reset cause, interpolation
+alphas, snapshot generation, and current/pending entity alignment. It grows the
+log quickly and is disabled by default. Clean shutdown restores all temporary
+hooks and window state.
+
+The interpolation clock automatically rebases if a short renderer stall leaves
+the next simulation snapshot more than the supported 32 ms presentation
+horizon behind wall time. `diagnostics.timeline_reset_key` provides a manual,
+presentation-only recovery as a fallback; it defaults to `F10`, accepts `F1`
+through `F24`, and can be disabled with `none`. Pressing it does not alter the
+simulation or save state.
+
+To remove a packaged copy, close the game and run
+`uninstall-preyhfr.cmd`; it removes only PreyHFR files.
 
 ## Repository layout
 
@@ -141,6 +163,14 @@ only PreyHFR files.
 - `cmake`: release manifest generation and package verification.
 - `packaging`: plain-text documentation included in binary releases.
 - `PreyHFR.ini`: documented release defaults.
+- `research` (ignored, local only): private development material. In the
+  current workspace, `research/game` contains the retail installation copy,
+  `research/tools` contains Ghidra/JDK/PresentMon, `research/ghidra` contains
+  analysis projects, `research/runtime` and `research/captures` contain
+  generated evidence, and `research/third_party` contains reference source.
+
+Always configure builds from the repository root. Copied CMake caches under
+`research/build*` refer to earlier source locations and must not be reused.
 
 No retail binaries, SDK source, decompilations, generated dumps, captures, or
 downloaded reference projects belong in this repository. The `.gitignore`

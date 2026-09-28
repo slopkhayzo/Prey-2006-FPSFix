@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PreyHFR VERSION 1.0.2 LANGUAGES CXX)
+project(PreyHFR VERSION 1.0.3 LANGUAGES CXX)
 
 set(PREYHFR_PRERELEASE "")
 if(PREYHFR_PRERELEASE)
@@ -192,9 +192,30 @@ if(BUILD_TESTING)
                 --no-continuous-snapshot-timing
                 --validate-config
     )
+    add_test(NAME PreyHFRInterpolationTraceValidation
+        COMMAND PreyHFRLauncher
+                --config "${CMAKE_SOURCE_DIR}/PreyHFR.ini"
+                --interpolation-trace --validate-config
+    )
+    add_test(NAME PreyHFRInterpolationTraceDependencyRejection
+        COMMAND PreyHFRLauncher --no-config
+                --interpolation-trace --validate-config
+    )
+    add_test(NAME PreyHFRTimelineResetKeyValidation
+        COMMAND PreyHFRLauncher --no-config --camera-interp
+                --timeline-reset-key F24 --validate-config
+    )
+    add_test(NAME PreyHFRTimelineResetKeyRejection
+        COMMAND PreyHFRLauncher --no-config --camera-interp
+                --timeline-reset-key F25 --validate-config
+    )
     set_tests_properties(PreyHFRDisplayConflictRejection
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFRCompatibilityDependencyRejection
+        PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(PreyHFRInterpolationTraceDependencyRejection
+        PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(PreyHFRTimelineResetKeyRejection
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(
         PreyHFRConfigValidation
@@ -204,6 +225,10 @@ if(BUILD_TESTING)
         PreyHFRDisplayConflictRejection
         PreyHFRRC1CompatibilityValidation
         PreyHFRCompatibilityDependencyRejection
+        PreyHFRInterpolationTraceValidation
+        PreyHFRInterpolationTraceDependencyRejection
+        PreyHFRTimelineResetKeyValidation
+        PreyHFRTimelineResetKeyRejection
         PROPERTIES WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     set_tests_properties(PreyHFRConfigValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
@@ -211,6 +236,10 @@ if(BUILD_TESTING)
     set_tests_properties(PreyHFRConfigOverrideValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
             "presentation_fps=144.*display_mode=windowed")
+    set_tests_properties(PreyHFRInterpolationTraceValidation PROPERTIES
+        PASS_REGULAR_EXPRESSION "interpolation_trace=on")
+    set_tests_properties(PreyHFRTimelineResetKeyValidation PROPERTIES
+        PASS_REGULAR_EXPRESSION "timeline_reset_key=F24")
 endif()
 
 set(CPACK_GENERATOR "ZIP")

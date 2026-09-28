@@ -88,6 +88,8 @@ struct Options {
     bool continuousSnapshotTiming = true;
     bool multiTicEntityAlignment = true;
     bool overdueSnapshotFallback = true;
+    bool interpolationTrace = false;
+    unsigned int timelineResetVirtualKey = VK_F10;
     bool borderless = false;
     DisplayMode displayMode = DisplayMode::Unspecified;
     std::optional<bool> vSync;
@@ -299,6 +301,37 @@ bool IsValidFrameCap(unsigned long value) {
     return value == 0 || (value >= 30 && value <= 1000);
 }
 
+std::optional<unsigned int> ParseTimelineResetKey(std::string value) {
+    const std::string normalized = LowerAscii(Trim(std::move(value)));
+    if (normalized == "none" || normalized == "off" ||
+        normalized == "disabled") {
+        return 0;
+    }
+    if (normalized.size() < 2 || normalized.front() != 'f') {
+        return std::nullopt;
+    }
+    try {
+        std::size_t parsed = 0;
+        const unsigned long functionKey =
+            std::stoul(normalized.substr(1), &parsed);
+        if (parsed != normalized.size() - 1 || functionKey < 1 ||
+            functionKey > 24) {
+            return std::nullopt;
+        }
+        return VK_F1 + static_cast<unsigned int>(functionKey - 1);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::string TimelineResetKeyName(unsigned int virtualKey) {
+    if (virtualKey == 0) return "none";
+    if (virtualKey >= VK_F1 && virtualKey <= VK_F24) {
+        return "F" + std::to_string(virtualKey - VK_F1 + 1);
+    }
+    return "unknown";
+}
+
 std::optional<fs::path> SelectConfigPath(int argc, wchar_t** argv,
                                          const fs::path& launcherDirectory,
                                          bool& explicitlyRequested) {
@@ -351,7 +384,8 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         if (line.front() == '[' && line.back() == ']') {
             section = LowerAscii(Trim(line.substr(1, line.size() - 2)));
             if (section != "patch" && section != "interpolation" &&
-                section != "compatibility" && section != "display") {
+                section != "compatibility" && section != "diagnostics" &&
+                section != "display") {
                 error = "unknown section [" + section + "] at line " +
                         std::to_string(lineNumber);
                 return false;
@@ -382,7 +416,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         return false;
     }
 
-    const std::array<std::string_view, 16> knownKeys{
+    const std::array<std::string_view, 18> knownKeys{
         "patch.enabled", "patch.presentation_fps", "patch.simulation_hz",
         "interpolation.enabled", "interpolation.camera",
         "interpolation.viewmodel", "interpolation.viewmodel_animation",
@@ -391,7 +425,9 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         "interpolation.world_max_angle",
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
-        "compatibility.overdue_snapshot_fallback", "display.borderless",
+        "compatibility.overdue_snapshot_fallback",
+        "diagnostics.interpolation_trace", "diagnostics.timeline_reset_key",
+        "display.borderless",
     };
     for (const auto& [key, entry] : values) {
         const bool known = std::find(knownKeys.begin(), knownKeys.end(), key) !=
@@ -470,8 +506,21 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
                      options.multiTicEntityAlignment) ||
         !readBoolean("compatibility.overdue_snapshot_fallback",
                      options.overdueSnapshotFallback) ||
+        !readBoolean("diagnostics.interpolation_trace",
+                     options.interpolationTrace) ||
         !readBoolean("display.borderless", options.borderless)) {
         return false;
+    }
+
+    const auto resetKey = values.find("diagnostics.timeline_reset_key");
+    if (resetKey != values.end()) {
+        const auto parsed = ParseTimelineResetKey(resetKey->second.first);
+        if (!parsed) {
+            error = "diagnostics.timeline_reset_key must be F1..F24 or none at line " +
+                    std::to_string(resetKey->second.second);
+            return false;
+        }
+        options.timelineResetVirtualKey = *parsed;
     }
 
     const auto readDouble = [&](const char* key, double minimum, double maximum,
@@ -541,6 +590,8 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                                                           bool continuousSnapshotTiming,
                                                           bool multiTicEntityAlignment,
                                                           bool overdueSnapshotFallback,
+                                                          bool interpolationTrace,
+                                                          unsigned int timelineResetVirtualKey,
                                                           bool borderless,
                                                           const std::optional<Resolution>& resolution) {
     LPWCH environment = GetEnvironmentStringsW();
@@ -564,6 +615,8 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
             !EnvironmentEntryHasName(entry, L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK") &&
+            !EnvironmentEntryHasName(entry, L"PREYHFR_INTERPOLATION_TRACE") &&
+            !EnvironmentEntryHasName(entry, L"PREYHFR_TIMELINE_RESET_KEY") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_BORDERLESS") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_RENDER_WIDTH") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_RENDER_HEIGHT")) {
@@ -597,6 +650,10 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                       (multiTicEntityAlignment ? L"1" : L"0"));
     entries.push_back(std::wstring(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK=") +
                       (overdueSnapshotFallback ? L"1" : L"0"));
+    entries.push_back(std::wstring(L"PREYHFR_INTERPOLATION_TRACE=") +
+                      (interpolationTrace ? L"1" : L"0"));
+    entries.push_back(L"PREYHFR_TIMELINE_RESET_KEY=" +
+                      std::to_wstring(timelineResetVirtualKey));
     entries.push_back(std::wstring(L"PREYHFR_BORDERLESS=") +
                       (borderless ? L"1" : L"0"));
     entries.push_back(L"PREYHFR_RENDER_WIDTH=" + std::to_wstring(
@@ -1050,6 +1107,30 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
             options.overdueSnapshotFallback = true;
         } else if (argument == L"--no-overdue-snapshot-fallback") {
             options.overdueSnapshotFallback = false;
+        } else if (argument == L"--interpolation-trace") {
+            options.interpolationTrace = true;
+        } else if (argument == L"--no-interpolation-trace") {
+            options.interpolationTrace = false;
+        } else if (argument == L"--timeline-reset-key" && index + 1 < argc) {
+            const std::wstring wideValue(argv[++index]);
+            if (!std::all_of(wideValue.begin(), wideValue.end(),
+                             [](wchar_t character) {
+                                 return character >= 0 && character <= 0x7f;
+                             })) {
+                std::wcerr << L"--timeline-reset-key must be F1..F24 or none.\n";
+                return std::nullopt;
+            }
+            std::string asciiValue;
+            asciiValue.reserve(wideValue.size());
+            for (const wchar_t character : wideValue) {
+                asciiValue.push_back(static_cast<char>(character));
+            }
+            const auto parsed = ParseTimelineResetKey(asciiValue);
+            if (!parsed) {
+                std::wcerr << L"--timeline-reset-key must be F1..F24 or none.\n";
+                return std::nullopt;
+            }
+            options.timelineResetVirtualKey = *parsed;
         } else if (argument == L"--borderless") {
             options.borderless = true;
         } else if (argument == L"--no-borderless") {
@@ -1090,6 +1171,8 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
                            L"[--continuous-snapshot-timing] "
                            L"[--multi-tic-entity-alignment] "
                            L"[--overdue-snapshot-fallback] "
+                           L"[--interpolation-trace|--no-interpolation-trace] "
+                           L"[--timeline-reset-key F1..F24|none] "
                            L"[--windowed|--exclusive|--borderless] "
                            L"[--vsync on|off] [--resolution WIDTHxHEIGHT] "
                            L"[--test-seconds N] "
@@ -1120,6 +1203,10 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
     }
     if (options.mouseInterpolation && !options.cameraInterpolation) {
         std::wcerr << L"--mouse-interp requires --camera-interp.\n";
+        return std::nullopt;
+    }
+    if (options.interpolationTrace && !options.cameraInterpolation) {
+        std::wcerr << L"--interpolation-trace requires --camera-interp.\n";
         return std::nullopt;
     }
     if (options.multiTicEntityAlignment &&
@@ -1950,6 +2037,8 @@ int Run(const Options& options) {
                                                  options.continuousSnapshotTiming,
                                                  options.multiTicEntityAlignment,
                                                  options.overdueSnapshotFallback,
+                                                 options.interpolationTrace,
+                                                 options.timelineResetVirtualKey,
                                                  options.borderless,
                                                  options.resolution);
         if (!childEnvironment) {
@@ -2022,6 +2111,10 @@ int Run(const Options& options) {
                   << (options.multiTicEntityAlignment ? "enabled" : "disabled")
                   << "; overdue snapshot fallback is "
                   << (options.overdueSnapshotFallback ? "enabled" : "disabled")
+                  << "; interpolation trace is "
+                  << (options.interpolationTrace ? "enabled" : "disabled")
+                  << "; timeline reset key is "
+                  << TimelineResetKeyName(options.timelineResetVirtualKey)
                   << "; borderless fullscreen is "
                   << (options.borderless ? "enabled" : "disabled")
                   << "; display mode is "
@@ -2253,6 +2346,10 @@ int wmain(int argc, wchar_t** argv) {
                       << (options->multiTicEntityAlignment ? "on" : "off")
                       << "; overdue_snapshot_fallback="
                       << (options->overdueSnapshotFallback ? "on" : "off")
+                      << "; interpolation_trace="
+                      << (options->interpolationTrace ? "on" : "off")
+                      << "; timeline_reset_key="
+                      << TimelineResetKeyName(options->timelineResetVirtualKey)
                       << "; borderless=" << (options->borderless ? "on" : "off")
                       << "; display_mode="
                       << (options->borderless

@@ -1,4 +1,4 @@
-PreyHFR 1.0.2
+PreyHFR 1.0.3
 ===============
 
 PreyHFR is an unofficial high-frame-rate fix for the Windows Steam release of
@@ -95,8 +95,8 @@ KNOWN LIMITS
   complete playthrough at 360 FPS.
 - Multiplayer, demos, timedemos, overlays, ReShade, and other injectors have
   not been validated.
-- Saving at checkpoints may cause a frame-time hitch. Briefly pausing and
-  unpausing the game may clear it.
+- Saving at checkpoints may still cause a one-off frame-time hitch. The
+  presentation clock automatically rebases if that hitch leaves it stale.
 - Borderless mode uses the primary display at its desktop resolution.
 
 
@@ -107,6 +107,9 @@ TROUBLESHOOTING
   same folder as prey.exe.
 - Check PreyHFR.log in the game folder after a launch problem.
 - If another program controls frame pacing, set presentation_fps = 0.
+- F10 manually resets only the presentation/interpolation timeline if motion
+  ever remains uneven after a hitch. The key is configurable or disableable in
+  PreyHFR.ini and does not alter simulation or save state.
 - To test the game without applying the patch, launch:
 
       PreyHFRLauncher.exe --disabled
@@ -131,3 +134,8 @@ PreyHFR is distributed under the MIT License. See PreyHFR-LICENSE.txt.
 Prey is a trademark of its respective owners. This unofficial project is not
 affiliated with or endorsed by Bethesda Softworks, ZeniMax Media, Human Head
 Studios, or 3D Realms.
+
+
+Misc
+--------------
+for more game fixes take a look at https://slop-blog.enkhayzomachines.net/fixes :)
