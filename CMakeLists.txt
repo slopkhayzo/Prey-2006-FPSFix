@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PreyHFR VERSION 1.0.3 LANGUAGES CXX)
+project(PreyHFR VERSION 1.0.4 LANGUAGES CXX)
 
 set(PREYHFR_PRERELEASE "")
 if(PREYHFR_PRERELEASE)
@@ -286,7 +286,7 @@ if(BUILD_TESTING)
         PROPERTIES WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     set_tests_properties(PreyHFRConfigValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
-            "presentation_fps=[0-9]+.*display_mode=borderless")
+            "presentation_fps=[0-9]+.*buffered_two_tic_interpolation=off.*display_mode=borderless")
     set_tests_properties(PreyHFRConfigOverrideValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
             "presentation_fps=144.*display_mode=windowed")

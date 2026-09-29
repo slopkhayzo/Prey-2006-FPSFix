@@ -88,6 +88,7 @@ struct Options {
     bool continuousSnapshotTiming = true;
     bool multiTicEntityAlignment = true;
     bool overdueSnapshotFallback = true;
+    bool bufferedTwoTicInterpolation = false;
     bool interpolationTrace = false;
     unsigned int timelineResetVirtualKey = VK_F10;
     bool borderless = false;
@@ -416,7 +417,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         return false;
     }
 
-    const std::array<std::string_view, 22> knownKeys{
+    const std::array<std::string_view, 23> knownKeys{
         "patch.enabled", "patch.presentation_fps", "patch.simulation_hz",
         "interpolation.enabled", "interpolation.camera",
         "interpolation.viewmodel", "interpolation.viewmodel_animation",
@@ -426,6 +427,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
         "compatibility.overdue_snapshot_fallback",
+        "compatibility.buffered_two_tic_interpolation",
         "diagnostics.view_log", "diagnostics.interpolation_trace",
         "diagnostics.timeline_reset_key", "display.borderless",
         "display.mode", "display.vsync", "display.resolution",
@@ -507,6 +509,8 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
                      options.multiTicEntityAlignment) ||
         !readBoolean("compatibility.overdue_snapshot_fallback",
                      options.overdueSnapshotFallback) ||
+        !readBoolean("compatibility.buffered_two_tic_interpolation",
+                     options.bufferedTwoTicInterpolation) ||
         !readBoolean("diagnostics.view_log", options.viewLog) ||
         !readBoolean("diagnostics.interpolation_trace",
                      options.interpolationTrace) ||
@@ -634,6 +638,7 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                                                           bool continuousSnapshotTiming,
                                                           bool multiTicEntityAlignment,
                                                           bool overdueSnapshotFallback,
+                                                          bool bufferedTwoTicInterpolation,
                                                           bool interpolationTrace,
                                                           unsigned int timelineResetVirtualKey,
                                                           bool borderless,
@@ -659,6 +664,7 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
             !EnvironmentEntryHasName(entry, L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK") &&
+            !EnvironmentEntryHasName(entry, L"PREYHFR_BUFFERED_TWO_TIC_INTERPOLATION") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_INTERPOLATION_TRACE") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_TIMELINE_RESET_KEY") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_BORDERLESS") &&
@@ -694,6 +700,8 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                       (multiTicEntityAlignment ? L"1" : L"0"));
     entries.push_back(std::wstring(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK=") +
                       (overdueSnapshotFallback ? L"1" : L"0"));
+    entries.push_back(std::wstring(L"PREYHFR_BUFFERED_TWO_TIC_INTERPOLATION=") +
+                      (bufferedTwoTicInterpolation ? L"1" : L"0"));
     entries.push_back(std::wstring(L"PREYHFR_INTERPOLATION_TRACE=") +
                       (interpolationTrace ? L"1" : L"0"));
     entries.push_back(L"PREYHFR_TIMELINE_RESET_KEY=" +
@@ -1151,6 +1159,10 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
             options.overdueSnapshotFallback = true;
         } else if (argument == L"--no-overdue-snapshot-fallback") {
             options.overdueSnapshotFallback = false;
+        } else if (argument == L"--buffered-two-tic-interpolation") {
+            options.bufferedTwoTicInterpolation = true;
+        } else if (argument == L"--no-buffered-two-tic-interpolation") {
+            options.bufferedTwoTicInterpolation = false;
         } else if (argument == L"--interpolation-trace") {
             options.interpolationTrace = true;
         } else if (argument == L"--no-interpolation-trace") {
@@ -1215,6 +1227,7 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
                            L"[--continuous-snapshot-timing] "
                            L"[--multi-tic-entity-alignment] "
                            L"[--overdue-snapshot-fallback] "
+                           L"[--buffered-two-tic-interpolation] "
                            L"[--interpolation-trace|--no-interpolation-trace] "
                            L"[--timeline-reset-key F1..F24|none] "
                            L"[--windowed|--exclusive|--borderless] "
@@ -1263,6 +1276,12 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
         !options.multiTicEntityAlignment) {
         std::wcerr << L"The overdue snapshot fallback requires multi-tic entity "
                       L"alignment. Disable both to select RC2 behavior.\n";
+        return std::nullopt;
+    }
+    if (options.bufferedTwoTicInterpolation &&
+        !options.continuousSnapshotTiming) {
+        std::wcerr << L"Buffered two-tic interpolation requires continuous "
+                      L"snapshot timing.\n";
         return std::nullopt;
     }
     if (options.borderless && options.displayMode == DisplayMode::Exclusive) {
@@ -2081,6 +2100,7 @@ int Run(const Options& options) {
                                                  options.continuousSnapshotTiming,
                                                  options.multiTicEntityAlignment,
                                                  options.overdueSnapshotFallback,
+                                                 options.bufferedTwoTicInterpolation,
                                                  options.interpolationTrace,
                                                  options.timelineResetVirtualKey,
                                                  options.borderless,
@@ -2155,6 +2175,10 @@ int Run(const Options& options) {
                   << (options.multiTicEntityAlignment ? "enabled" : "disabled")
                   << "; overdue snapshot fallback is "
                   << (options.overdueSnapshotFallback ? "enabled" : "disabled")
+                  << "; buffered two-tic interpolation is "
+                  << (options.bufferedTwoTicInterpolation
+                          ? "enabled"
+                          : "disabled")
                   << "; interpolation trace is "
                   << (options.interpolationTrace ? "enabled" : "disabled")
                   << "; timeline reset key is "
@@ -2390,6 +2414,8 @@ int wmain(int argc, wchar_t** argv) {
                       << (options->multiTicEntityAlignment ? "on" : "off")
                       << "; overdue_snapshot_fallback="
                       << (options->overdueSnapshotFallback ? "on" : "off")
+                      << "; buffered_two_tic_interpolation="
+                      << (options->bufferedTwoTicInterpolation ? "on" : "off")
                       << "; interpolation_trace="
                       << (options->interpolationTrace ? "on" : "off")
                       << "; timeline_reset_key="

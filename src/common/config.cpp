@@ -194,7 +194,7 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         return false;
     }
 
-    constexpr std::array<std::string_view, 22> knownKeys{
+    constexpr std::array<std::string_view, 23> knownKeys{
         "patch.enabled", "patch.presentation_fps", "patch.simulation_hz",
         "interpolation.enabled", "interpolation.camera",
         "interpolation.viewmodel", "interpolation.viewmodel_animation",
@@ -204,6 +204,7 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
         "compatibility.overdue_snapshot_fallback",
+        "compatibility.buffered_two_tic_interpolation",
         "diagnostics.view_log", "diagnostics.interpolation_trace",
         "diagnostics.timeline_reset_key", "display.borderless",
         "display.mode", "display.vsync", "display.resolution",
@@ -284,6 +285,8 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
                      config.multiTicEntityAlignment) ||
         !readBoolean("compatibility.overdue_snapshot_fallback",
                      config.overdueSnapshotFallback) ||
+        !readBoolean("compatibility.buffered_two_tic_interpolation",
+                     config.bufferedTwoTicInterpolation) ||
         !readBoolean("diagnostics.view_log", config.viewLog) ||
         !readBoolean("diagnostics.interpolation_trace",
                      config.interpolationTrace) ||
@@ -406,6 +409,11 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         error = "compatibility.overdue_snapshot_fallback requires multi_tic_entity_alignment";
         return false;
     }
+    if (config.bufferedTwoTicInterpolation &&
+        !config.continuousSnapshotTiming) {
+        error = "compatibility.buffered_two_tic_interpolation requires continuous_snapshot_timing";
+        return false;
+    }
     if (config.borderless && config.displayMode == DisplayMode::Exclusive) {
         error = "display.borderless cannot be combined with display.mode=exclusive";
         return false;
@@ -471,6 +479,8 @@ std::string DescribeConfig(const Config& config) {
            << (config.multiTicEntityAlignment ? "on" : "off")
            << "; overdue_snapshot_fallback="
            << (config.overdueSnapshotFallback ? "on" : "off")
+           << "; buffered_two_tic_interpolation="
+           << (config.bufferedTwoTicInterpolation ? "on" : "off")
            << "; interpolation_trace="
            << (config.interpolationTrace ? "on" : "off")
            << "; timeline_reset_key="

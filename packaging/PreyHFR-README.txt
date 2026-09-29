@@ -1,4 +1,4 @@
-PreyHFR 1.0.3
+PreyHFR 1.0.4
 ===============
 
 PreyHFR is an unofficial 32-bit ASI high-frame-rate fix for the Windows Steam
@@ -6,6 +6,17 @@ release of Prey (2006) version 1.4. It lets the game present at modern refresh
 rates while keeping gameplay at its original speed.
 
 No original game files are replaced or modified.
+
+
+WHAT'S NEW IN 1.0.4
+-------------------
+
+- Stabilizes the confirmed native 16 ms async-timer thread so process-start
+  clock phase can no longer produce recurring zero-tic/paired-tic cadence.
+  Every other game thread continues to see the real Windows clock.
+- Restores the lower-latency interpolation architecture as the default.
+- Retains the one-native-tic authoritative buffer as the optional
+  compatibility.buffered_two_tic_interpolation setting, defaulting to false.
 
 
 QUICK INSTALL - BUNDLE WITH LOADER
@@ -87,6 +98,12 @@ To request an explicit exclusive resolution:
 
 The display.vsync setting accepts game, on, or off. Borderless always uses the
 primary desktop resolution and cannot be combined with exclusive mode.
+
+The compatibility.buffered_two_tic_interpolation setting defaults to false.
+Enabling it keeps one completed native simulation tic buffered to tolerate
+irregular producer delivery, at the cost of one native tic of positional
+presentation latency. The normal lower-latency interpolation path is preferred
+now that PreyHFR stabilizes the game's asynchronous tic clock directly.
 
 
 SUPPORTED GAME VERSION

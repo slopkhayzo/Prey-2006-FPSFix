@@ -102,6 +102,7 @@ int wmain(int argc, wchar_t** argv) {
     SetEnvironmentVariableW(L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING", L"1");
     SetEnvironmentVariableW(L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT", L"1");
     SetEnvironmentVariableW(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK", L"1");
+    SetEnvironmentVariableW(L"PREYHFR_BUFFERED_TWO_TIC_INTERPOLATION", L"0");
     SetEnvironmentVariableW(L"PREYHFR_BORDERLESS", L"1");
     SetProcessDPIAware();
     SetEnvironmentVariableW(

@@ -42,11 +42,21 @@ errors and partially installed hooks are rolled back.
 
 ## Current status
 
-Version `1.0.3` adds automatic recovery when a checkpoint or other short stall
-leaves the presentation clock outside its supported interpolation horizon. It
-also provides a configurable, presentation-only emergency reset key, defaulting
-to `F10`. The checkpoint reproducer that previously left interpolation
-permanently clamped recovered on the next snapshot in focused live testing.
+Version `1.0.4` stabilizes the retail asynchronous tic scheduler itself. Only
+the confirmed native 16 ms timer thread receives an exact synthetic
+`timeGetTime` timeline; all other threads retain real Windows time. This removes
+the launch-dependent zero-tic/paired-tic cadence that could make player,
+camera, weapon, and animation interpolation pulse several times per second.
+Nine repeated launches recorded 45,571 confirmed timer wakes without an
+ordinary zero-tic callback; the rare multi-tic advances matched genuine
+QPC-measured missed periods.
+
+The lower-latency interpolation architecture is again the default. The newer
+one-native-tic authoritative buffer remains available through
+`compatibility.buffered_two_tic_interpolation`, defaulting to `false`, for
+systems that benefit from additional producer lookahead. Automatic checkpoint
+stall recovery and the configurable presentation-only `F10` reset remain
+available as independent safeguards.
 
 The underlying patch stack completed a full single-player playthrough at 360 Hz
 with no major issues observed and has also been exercised in focused tests at
@@ -87,7 +97,7 @@ cmake --build build-x86 --target PreyHFRBundlePackage
 ```
 
 `PreyHFRPackage` creates and verifies the plugin-only
-`build-x86/release/PreyHFR-1.0.3-windows-x86.zip`.
+`build-x86/release/PreyHFR-1.0.4-windows-x86.zip`.
 `PreyHFRBundlePackage` creates the separate `-with-loader.zip`, pins and
 checksum-verifies Ultimate ASI Loader v9.7.4, and includes its upstream license
 and provenance. Neither build downloads dependencies.
@@ -123,6 +133,12 @@ running two active limiters. `display.mode`, `display.vsync`, and
 `display.resolution` replace the old launcher's display arguments. Every
 interpolation layer has an independent diagnostic toggle. Invalid settings are
 reported to the log and leave the patch inactive.
+
+`compatibility.buffered_two_tic_interpolation` defaults to `false`. Enabling it
+keeps one completed native tic as authoritative presentation lookahead, which
+can tolerate irregular producer delivery but adds about 16 ms of positional
+presentation latency. It is not normally required with the stabilized async
+clock.
 
 `PreyHFR.log` is written beside `PreyHFR.asi`. Include it when reporting an
 issue. For a repeatable interpolation problem, enable

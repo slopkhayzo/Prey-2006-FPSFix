@@ -39,6 +39,7 @@ struct Config {
     bool continuousSnapshotTiming = true;
     bool multiTicEntityAlignment = true;
     bool overdueSnapshotFallback = true;
+    bool bufferedTwoTicInterpolation = false;
     bool interpolationTrace = false;
     unsigned int timelineResetVirtualKey = 0x79; // VK_F10
     bool borderless = false;
