@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PreyHFR VERSION 1.0.4 LANGUAGES CXX)
+project(PreyHFR VERSION 1.0.5 LANGUAGES CXX)
 
 set(PREYHFR_PRERELEASE "")
 if(PREYHFR_PRERELEASE)
@@ -255,6 +255,14 @@ if(BUILD_TESTING)
         COMMAND PreyHFRLauncher --no-config
                 --interpolation-trace --validate-config
     )
+    add_test(NAME PreyHFREffectInterpolationValidation
+        COMMAND PreyHFRLauncher --no-config --camera-interp
+                --effects-interp --validate-config
+    )
+    add_test(NAME PreyHFREffectInterpolationDependencyRejection
+        COMMAND PreyHFRLauncher --no-config
+                --effects-interp --validate-config
+    )
     add_test(NAME PreyHFRTimelineResetKeyValidation
         COMMAND PreyHFRLauncher --no-config --camera-interp
                 --timeline-reset-key F24 --validate-config
@@ -269,6 +277,8 @@ if(BUILD_TESTING)
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFRInterpolationTraceDependencyRejection
         PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(PreyHFREffectInterpolationDependencyRejection
+        PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFRTimelineResetKeyRejection
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(
@@ -281,17 +291,21 @@ if(BUILD_TESTING)
         PreyHFRCompatibilityDependencyRejection
         PreyHFRInterpolationTraceValidation
         PreyHFRInterpolationTraceDependencyRejection
+        PreyHFREffectInterpolationValidation
+        PreyHFREffectInterpolationDependencyRejection
         PreyHFRTimelineResetKeyValidation
         PreyHFRTimelineResetKeyRejection
         PROPERTIES WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     set_tests_properties(PreyHFRConfigValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
-            "presentation_fps=[0-9]+.*buffered_two_tic_interpolation=off.*display_mode=borderless")
+            "presentation_fps=[0-9]+.*effects=on.*buffered_two_tic_interpolation=off.*display_mode=borderless")
     set_tests_properties(PreyHFRConfigOverrideValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
             "presentation_fps=144.*display_mode=windowed")
     set_tests_properties(PreyHFRInterpolationTraceValidation PROPERTIES
         PASS_REGULAR_EXPRESSION "interpolation_trace=on")
+    set_tests_properties(PreyHFREffectInterpolationValidation PROPERTIES
+        PASS_REGULAR_EXPRESSION "effects=on")
     set_tests_properties(PreyHFRTimelineResetKeyValidation PROPERTIES
         PASS_REGULAR_EXPRESSION "timeline_reset_key=F24")
 endif()

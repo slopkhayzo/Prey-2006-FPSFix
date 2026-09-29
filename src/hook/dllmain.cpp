@@ -28,6 +28,9 @@ namespace fs = std::filesystem;
 namespace {
 
 using SwapBuffersFn = BOOL(WINAPI*)(HDC);
+using WglGetCurrentContextFn = void*(WINAPI*)();
+using WglGetProcAddressFn = PROC(WINAPI*)(LPCSTR);
+using WglGetSwapIntervalExtFn = int(WINAPI*)();
 using SingleViewFn = void(__thiscall*)(void*, void*, const void*);
 using CalculateRenderViewFn = void(__thiscall*)(void*);
 using AddEntityDefFn = int(__thiscall*)(void*, const void*);
@@ -79,6 +82,7 @@ constexpr std::size_t kCalculateRenderViewStolenBytes = 6;
 constexpr std::size_t kDetermineViewAnglesStolenBytes = 6;
 constexpr std::size_t kMouseMoveStolenBytes = 9;
 constexpr std::size_t kRenderViewSize = 140;
+constexpr std::size_t kRenderViewTimeOffset = 80;
 constexpr std::size_t kRenderEntityAllowViewIdOffset = 56;
 constexpr std::size_t kRenderEntityOriginOffset = 60;
 constexpr std::size_t kRenderEntityAxisOffset = 72;
@@ -153,6 +157,7 @@ constexpr GUID kSystemMouseGuid{
 
 SwapBuffersFn g_originalSwapBuffers = nullptr;
 IMAGE_THUNK_DATA32* g_swapBuffersThunk = nullptr;
+std::atomic<int> g_swapIntervalProbeState{0};
 HMODULE g_pluginModule = nullptr;
 bool g_probeMode = false;
 std::atomic<bool> g_patchActive{false};
@@ -252,6 +257,7 @@ bool g_viewModelInterpolationRequested = false;
 bool g_viewModelAnimationInterpolationRequested = false;
 bool g_worldInterpolationRequested = false;
 bool g_worldAnimationInterpolationRequested = false;
+bool g_effectInterpolationRequested = false;
 bool g_mouseInterpolationRequested = false;
 bool g_continuousSnapshotTimingRequested = false;
 bool g_multiTicEntityAlignmentRequested = false;
@@ -3240,6 +3246,35 @@ double CameraRotationInterpolationAlpha(double interpolationAlpha) {
     return std::clamp(interpolationAlpha, 0.0, 1.0);
 }
 
+std::int32_t InterpolatedPresentationTime(std::int32_t previousTime,
+                                          std::int32_t currentTime,
+                                          double interpolationAlpha) {
+    // Renderer particles and material expressions are pure functions of the
+    // render-view clock. Keep that clock on the same authoritative interval
+    // as the camera, but never predict effects beyond the newest game tic.
+    const double alpha = std::clamp(interpolationAlpha, 0.0, 1.0);
+    const double time = static_cast<double>(previousTime) +
+        static_cast<double>(static_cast<std::int64_t>(currentTime) -
+                            static_cast<std::int64_t>(previousTime)) * alpha;
+    return static_cast<std::int32_t>(std::llround(time));
+}
+
+bool ApplyInterpolatedEffectTime(
+    std::array<std::uint8_t, kRenderViewSize>& view,
+    double interpolationAlpha) {
+    if (!g_effectInterpolationRequested || !g_canInterpolateCamera) {
+        return false;
+    }
+    const auto previousTime = ReadUnaligned<std::int32_t>(
+        g_cameraPrevious.data(), kRenderViewTimeOffset);
+    const auto currentTime = ReadUnaligned<std::int32_t>(
+        g_cameraCurrent.data(), kRenderViewTimeOffset);
+    WriteUnaligned(view.data(), kRenderViewTimeOffset,
+                   InterpolatedPresentationTime(previousTime, currentTime,
+                                                interpolationAlpha));
+    return true;
+}
+
 double LatestNativeTicInterpolationAlphaForMode(
     std::int64_t nowQpc, std::int64_t currentSnapshotQpc,
     std::int64_t frequency, bool overdueSnapshotFallback) {
@@ -4003,7 +4038,7 @@ void ObserveView(const void* view) {
 
 void AppendInterpolationTrace(
     const void* sourceView, const void* presentedView,
-    bool cameraInterpolated, bool mouseOverlaid,
+    bool cameraInterpolated, bool effectsTimeApplied, bool mouseOverlaid,
     double cameraAlpha, double latestTicAlpha, double pendingTicAlpha,
     double basePitch,
     std::size_t appliedEntityCount,
@@ -4071,6 +4106,10 @@ void AppendInterpolationTrace(
 
     const auto sourceOrigin = ReadOrigin(sourceView);
     const auto presentedOrigin = ReadOrigin(presentedView);
+    const auto sourceTime = ReadUnaligned<std::int32_t>(
+        sourceView, kRenderViewTimeOffset);
+    const auto presentedTime = ReadUnaligned<std::int32_t>(
+        presentedView, kRenderViewTimeOffset);
     const auto sourceAxis = ReadAxis(sourceView);
     const auto presentedAxis = ReadAxis(presentedView);
     const std::int32_t comTicNumber = ReadComTicNumber();
@@ -4140,7 +4179,8 @@ void AppendInterpolationTrace(
         "producer_buffer_depth=%u producer_buffer_advances=%u "
         "producer_settled_advances=%u "
         "fov_interpolated=%d can_interpolate=%d "
-        "camera_applied=%d mouse_applied=%d "
+        "camera_applied=%d effects_time_applied=%d mouse_applied=%d "
+        "source_time=%d presented_time=%d "
         "alpha=%.6f latest_alpha=%.6f pending_alpha=%.6f "
         "source_origin=%.4f,%.4f,%.4f presented_origin=%.4f,%.4f,%.4f "
         "source_forward=%.6f,%.6f,%.6f "
@@ -4193,7 +4233,8 @@ void AppendInterpolationTrace(
         g_cameraFrameProbe.producerSettledAdvances,
         g_cameraFrameProbe.fovInterpolated ? 1 : 0,
         g_canInterpolateCamera ? 1 : 0, cameraInterpolated ? 1 : 0,
-        mouseOverlaid ? 1 : 0, cameraAlpha, latestTicAlpha,
+        effectsTimeApplied ? 1 : 0, mouseOverlaid ? 1 : 0,
+        sourceTime, presentedTime, cameraAlpha, latestTicAlpha,
         pendingTicAlpha, sourceOrigin[0], sourceOrigin[1], sourceOrigin[2],
         presentedOrigin[0], presentedOrigin[1], presentedOrigin[2],
         sourceAxis[0], sourceAxis[1], sourceAxis[2], presentedAxis[0],
@@ -4371,6 +4412,8 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
         BuildInterpolatedView(view, temporary, interpolationAlpha,
                               latestTicAlpha, pendingTicAlpha, basePitch,
                               basePitchValid);
+    const bool effectsTimeApplied = cameraInterpolated &&
+        ApplyInterpolatedEffectTime(temporary, interpolationAlpha);
     const void* baseView = cameraInterpolated ? temporary.data() : view;
     MouseOverlay mouseOverlay;
     const bool mouseOverlaid = ApplyPendingMouseOverlay(
@@ -4387,7 +4430,8 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
                                         g_appliedEntityPoses);
     AppendAnimatedWorldEntityTrace(g_appliedEntityPoses, appliedCount);
     AppendInterpolationTrace(
-        view, presentedView, cameraInterpolated, mouseOverlaid,
+        view, presentedView, cameraInterpolated, effectsTimeApplied,
+        mouseOverlaid,
         interpolationAlpha, latestTicAlpha, pendingTicAlpha, basePitch,
         appliedCount,
         g_appliedEntityPoses, beforeEntities);
@@ -5887,6 +5931,50 @@ void ReportFrame() {
     g_viewCounters = {};
 }
 
+void LogActiveSwapIntervalOnce() {
+    if (g_swapIntervalProbeState.load(std::memory_order_acquire) != 0) return;
+
+    HMODULE openGl = GetModuleHandleW(L"opengl32.dll");
+    if (openGl == nullptr) return;
+    const auto getCurrentContext = reinterpret_cast<WglGetCurrentContextFn>(
+        GetProcAddress(openGl, "wglGetCurrentContext"));
+    const auto getProcAddress = reinterpret_cast<WglGetProcAddressFn>(
+        GetProcAddress(openGl, "wglGetProcAddress"));
+    if (getCurrentContext == nullptr || getProcAddress == nullptr ||
+        getCurrentContext() == nullptr) {
+        return;
+    }
+
+    const PROC raw = getProcAddress("wglGetSwapIntervalEXT");
+    const auto rawValue = reinterpret_cast<std::uintptr_t>(raw);
+    if (raw == nullptr || rawValue <= 3 || rawValue == UINTPTR_MAX) {
+        int expected = 0;
+        if (g_swapIntervalProbeState.compare_exchange_strong(
+                expected, 2, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            Log("display: WGL_EXT_swap_control query unavailable; VRR state is driver-controlled\r\n");
+        }
+        return;
+    }
+
+    const auto getSwapInterval =
+        reinterpret_cast<WglGetSwapIntervalExtFn>(raw);
+    const int interval = getSwapInterval();
+    int expected = 0;
+    if (g_swapIntervalProbeState.compare_exchange_strong(
+            expected, 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        char buffer[192]{};
+        const int length = _snprintf_s(
+            buffer, sizeof(buffer), _TRUNCATE,
+            "display: active WGL swap interval=%d; VRR engagement remains driver-controlled\r\n",
+            interval);
+        if (length > 0) {
+            Log(std::string(buffer, static_cast<std::size_t>(length)));
+        }
+    }
+}
+
 BOOL WINAPI HookedSwapBuffers(HDC deviceContext) {
     int waitingForDisplayOverrides = 0;
     g_displayOverrideStartupState.compare_exchange_strong(
@@ -5906,6 +5994,7 @@ BOOL WINAPI HookedSwapBuffers(HDC deviceContext) {
     TryInstallMouseMoveHook();
     TryInstallUsercmdHooks();
     TryApplyBorderlessWindow(deviceContext);
+    LogActiveSwapIntervalOnce();
     PollTimelineResetKey();
     WaitForDeadline();
     const BOOL result = g_originalSwapBuffers(deviceContext);
@@ -5935,6 +6024,9 @@ void ConfigureFromEnvironment() {
         g_cameraInterpolationRequested;
     g_worldAnimationInterpolationRequested =
         ReadEnvironmentFlag(L"PREYHFR_WORLD_ANIM_INTERP") &&
+        g_cameraInterpolationRequested;
+    g_effectInterpolationRequested =
+        ReadEnvironmentFlag(L"PREYHFR_EFFECT_INTERP") &&
         g_cameraInterpolationRequested;
     g_maximumWorldEntityStep = ReadEnvironmentDouble(
         L"PREYHFR_WORLD_MAX_DISTANCE", kDefaultMaximumWorldEntityStep,
@@ -5982,6 +6074,8 @@ void ConfigureFromConfig(const preyhfr::Config& config) {
         config.worldInterpolation && config.cameraInterpolation;
     g_worldAnimationInterpolationRequested =
         config.worldAnimationInterpolation && config.cameraInterpolation;
+    g_effectInterpolationRequested =
+        config.effectInterpolation && config.cameraInterpolation;
     g_maximumWorldEntityStep = config.maximumWorldEntityDistance;
     g_maximumWorldEntityAngleDegrees = config.maximumWorldEntityAngle;
     g_mouseInterpolationRequested =
@@ -6077,6 +6171,7 @@ bool InstallConfiguredHooks(unsigned int cap) {
                                    "view_log=%s; camera_interp=%s; "
                                    "viewmodel_interp=%s; viewmodel_anim_interp=%s; "
                                    "world_interp=%s; world_anim_interp=%s; "
+                                   "effect_interp=%s; "
                                    "world_max_distance=%.3f; world_max_angle=%.3f; "
                                    "mouse_interp=%s; continuous_snapshot_timing=%s; "
                                    "multi_tic_entity_alignment=%s; "
@@ -6094,6 +6189,9 @@ bool InstallConfiguredHooks(unsigned int cap) {
                                        : "disabled",
                                    g_worldInterpolationRequested ? "enabled" : "disabled",
                                    g_worldAnimationInterpolationRequested
+                                       ? "enabled"
+                                       : "disabled",
+                                   g_effectInterpolationRequested
                                        ? "enabled"
                                        : "disabled",
                                    g_maximumWorldEntityStep,
@@ -6795,6 +6893,10 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                    0.5) ||
              !close(CameraRotationInterpolationAlpha(0.75), 0.75) ||
              !close(CameraRotationInterpolationAlpha(1.75), 1.0) ||
+            InterpolatedPresentationTime(1000, 1016, -0.5) != 1000 ||
+            InterpolatedPresentationTime(1000, 1016, 0.25) != 1004 ||
+            InterpolatedPresentationTime(1000, 1016, 1.0) != 1016 ||
+            InterpolatedPresentationTime(1000, 1016, 1.75) != 1016 ||
             CameraSnapshotClockDebtExceeded(
                 0, kNativeTicMilliseconds,
                 kMaximumInterpolatedCameraIntervalMilliseconds,

@@ -194,12 +194,13 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         return false;
     }
 
-    constexpr std::array<std::string_view, 23> knownKeys{
+    constexpr std::array<std::string_view, 24> knownKeys{
         "patch.enabled", "patch.presentation_fps", "patch.simulation_hz",
         "interpolation.enabled", "interpolation.camera",
         "interpolation.viewmodel", "interpolation.viewmodel_animation",
         "interpolation.world", "interpolation.world_animation",
-        "interpolation.mouse", "interpolation.world_max_distance",
+        "interpolation.effects", "interpolation.mouse",
+        "interpolation.world_max_distance",
         "interpolation.world_max_angle",
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
@@ -269,6 +270,7 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         config.viewModelAnimationInterpolation = interpolationEnabled;
         config.worldInterpolation = interpolationEnabled;
         config.worldAnimationInterpolation = interpolationEnabled;
+        config.effectInterpolation = interpolationEnabled;
         config.mouseInterpolation = interpolationEnabled;
     }
     if (!readBoolean("interpolation.camera", config.cameraInterpolation) ||
@@ -278,6 +280,7 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         !readBoolean("interpolation.world", config.worldInterpolation) ||
         !readBoolean("interpolation.world_animation",
                      config.worldAnimationInterpolation) ||
+        !readBoolean("interpolation.effects", config.effectInterpolation) ||
         !readBoolean("interpolation.mouse", config.mouseInterpolation) ||
         !readBoolean("compatibility.continuous_snapshot_timing",
                      config.continuousSnapshotTiming) ||
@@ -396,6 +399,7 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         !requireCamera(config.worldInterpolation, "interpolation.world") ||
         !requireCamera(config.worldAnimationInterpolation,
                        "interpolation.world_animation") ||
+        !requireCamera(config.effectInterpolation, "interpolation.effects") ||
         !requireCamera(config.mouseInterpolation, "interpolation.mouse") ||
         !requireCamera(config.interpolationTrace,
                        "diagnostics.interpolation_trace")) {
@@ -472,6 +476,7 @@ std::string DescribeConfig(const Config& config) {
            << "; world=" << (config.worldInterpolation ? "on" : "off")
            << "; world_animation="
            << (config.worldAnimationInterpolation ? "on" : "off")
+           << "; effects=" << (config.effectInterpolation ? "on" : "off")
            << "; mouse=" << (config.mouseInterpolation ? "on" : "off")
            << "; continuous_snapshot_timing="
            << (config.continuousSnapshotTiming ? "on" : "off")

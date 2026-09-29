@@ -1,4 +1,4 @@
-PreyHFR 1.0.4
+PreyHFR 1.0.5
 ===============
 
 PreyHFR is an unofficial 32-bit ASI high-frame-rate fix for the Windows Steam
@@ -8,15 +8,18 @@ rates while keeping gameplay at its original speed.
 No original game files are replaced or modified.
 
 
-WHAT'S NEW IN 1.0.4
+WHAT'S NEW IN 1.0.5
 -------------------
 
-- Stabilizes the confirmed native 16 ms async-timer thread so process-start
-  clock phase can no longer produce recurring zero-tic/paired-tic cadence.
-  Every other game thread continues to see the real Windows clock.
-- Restores the lower-latency interpolation architecture as the default.
-- Retains the one-native-tic authoritative buffer as the optional
-  compatibility.buffered_two_tic_interpolation setting, defaulting to false.
+- Advances renderer-only particle and material time on every presented frame,
+  eliminating the 16 ms hold-and-jump strobe visible in continuous fire and
+  similar effects at high presentation rates.
+- Keeps gameplay FX spawning, scripts, sound, and simulation on the original
+  62.5 Hz clock.
+- Logs the active WGL swap interval when supported. Variable-refresh engagement
+  remains driver-controlled and should be confirmed with the driver's overlay.
+- Retains the async-timer cadence stabilization and lower-latency interpolation
+  architecture introduced in 1.0.4.
 
 
 QUICK INSTALL - BUNDLE WITH LOADER
@@ -60,7 +63,8 @@ The included PreyHFR.ini automatically:
 - detects the primary monitor's current refresh rate;
 - uses the primary monitor's desktop resolution;
 - starts the game in borderless mode;
-- enables camera, weapon, world, animation, and mouse interpolation; and
+- enables camera, weapon, world, animation, effects, and mouse interpolation;
+- advances only renderer particle/material time between native tics; and
 - keeps the original 62.5 Hz simulation rate so gameplay does not speed up.
 
 
@@ -96,8 +100,14 @@ To request an explicit exclusive resolution:
     mode = exclusive
     resolution = 1920x1080
 
-The display.vsync setting accepts game, on, or off. Borderless always uses the
-primary desktop resolution and cannot be combined with exclusive mode.
+The display.vsync setting accepts game, on, or off and defaults to game.
+Variable-refresh engagement is controlled by the display driver; G-SYNC does
+not require V-Sync while the presentation rate remains below the refresh
+ceiling. Borderless always uses the primary desktop resolution and cannot be
+combined with exclusive mode.
+
+The interpolation.effects setting controls presentation-rate renderer particle
+and material time. It does not advance gameplay FX, scripts, or simulation.
 
 The compatibility.buffered_two_tic_interpolation setting defaults to false.
 Enabling it keeps one completed native simulation tic buffered to tolerate

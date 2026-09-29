@@ -11,8 +11,9 @@ PreyHFR is an experimental high-frame-rate presentation fix for the Windows
 Steam release of *Prey* (2006) 1.4. It keeps the original 16 ms (62.5 Hz)
 simulation while allowing higher presentation rates, then interpolates the
 camera, first-person weapon, world transforms, skeletal animation, and mouse
-look between simulation ticks, with a frame-by-frame override for mouse deltas,
-to restore low input latency.
+look between simulation ticks. Renderer-only particle/material time follows the
+same presentation clock, while a frame-by-frame mouse override restores low
+input latency.
 
 The patch is a 32-bit ASI plugin loaded in-process by a standard external ASI
 loader. It does not replace or modify
@@ -42,14 +43,16 @@ errors and partially installed hooks are rolled back.
 
 ## Current status
 
-Version `1.0.4` stabilizes the retail asynchronous tic scheduler itself. Only
-the confirmed native 16 ms timer thread receives an exact synthetic
-`timeGetTime` timeline; all other threads retain real Windows time. This removes
-the launch-dependent zero-tic/paired-tic cadence that could make player,
-camera, weapon, and animation interpolation pulse several times per second.
-Nine repeated launches recorded 45,571 confirmed timer wakes without an
-ordinary zero-tic callback; the rare multi-tic advances matched genuine
-QPC-measured missed periods.
+Version `1.0.5` extends the presentation timeline to renderer-only particle and
+material evaluation. Continuous effects such as fire now advance on every
+presented frame instead of holding one native 16 ms state and then jumping to
+the next. Gameplay FX spawning, scripts, sound, and simulation time remain on
+the original 62.5 Hz clock. Runtime testing at 350 and 360 FPS confirmed smooth
+fire motion with G-SYNC active.
+
+The asynchronous-tic stabilization introduced in 1.0.4 remains unchanged. Only
+the confirmed native 16 ms timer thread receives its synthetic `timeGetTime`
+timeline; all other threads retain real Windows time.
 
 The lower-latency interpolation architecture is again the default. The newer
 one-native-tic authoritative buffer remains available through
@@ -97,7 +100,7 @@ cmake --build build-x86 --target PreyHFRBundlePackage
 ```
 
 `PreyHFRPackage` creates and verifies the plugin-only
-`build-x86/release/PreyHFR-1.0.4-windows-x86.zip`.
+`build-x86/release/PreyHFR-1.0.5-windows-x86.zip`.
 `PreyHFRBundlePackage` creates the separate `-with-loader.zip`, pins and
 checksum-verifies Ultimate ASI Loader v9.7.4, and includes its upstream license
 and provenance. Neither build downloads dependencies.
@@ -133,6 +136,14 @@ running two active limiters. `display.mode`, `display.vsync`, and
 `display.resolution` replace the old launcher's display arguments. Every
 interpolation layer has an independent diagnostic toggle. Invalid settings are
 reported to the log and leave the patch inactive.
+
+Variable-refresh engagement remains controlled by the display driver. The log
+reports the active WGL swap interval when the extension is available, but that
+value does not report whether G-SYNC itself is engaged.
+
+`interpolation.effects` advances the renderer's deterministic particle and
+material clock between native ticks. It does not run gameplay FX, scripts, or
+simulation more often.
 
 `compatibility.buffered_two_tic_interpolation` defaults to `false`. Enabling it
 keeps one completed native tic as authoritative presentation lookahead, which

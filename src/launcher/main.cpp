@@ -82,6 +82,7 @@ struct Options {
     bool viewModelAnimationInterpolation = false;
     bool worldInterpolation = false;
     bool worldAnimationInterpolation = false;
+    bool effectInterpolation = false;
     double maximumWorldEntityDistance = 128.0;
     double maximumWorldEntityAngle = 90.0;
     bool mouseInterpolation = false;
@@ -417,12 +418,13 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         return false;
     }
 
-    const std::array<std::string_view, 23> knownKeys{
+    const std::array<std::string_view, 24> knownKeys{
         "patch.enabled", "patch.presentation_fps", "patch.simulation_hz",
         "interpolation.enabled", "interpolation.camera",
         "interpolation.viewmodel", "interpolation.viewmodel_animation",
         "interpolation.world", "interpolation.world_animation",
-        "interpolation.mouse", "interpolation.world_max_distance",
+        "interpolation.effects", "interpolation.mouse",
+        "interpolation.world_max_distance",
         "interpolation.world_max_angle",
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
@@ -493,6 +495,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         options.viewModelAnimationInterpolation = interpolationEnabled;
         options.worldInterpolation = interpolationEnabled;
         options.worldAnimationInterpolation = interpolationEnabled;
+        options.effectInterpolation = interpolationEnabled;
         options.mouseInterpolation = interpolationEnabled;
     }
     if (!readBoolean("interpolation.camera", options.cameraInterpolation) ||
@@ -502,6 +505,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         !readBoolean("interpolation.world", options.worldInterpolation) ||
         !readBoolean("interpolation.world_animation",
                      options.worldAnimationInterpolation) ||
+        !readBoolean("interpolation.effects", options.effectInterpolation) ||
         !readBoolean("interpolation.mouse", options.mouseInterpolation) ||
         !readBoolean("compatibility.continuous_snapshot_timing",
                      options.continuousSnapshotTiming) ||
@@ -632,6 +636,7 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                                                           bool viewModelAnimationInterpolation,
                                                           bool worldInterpolation,
                                                           bool worldAnimationInterpolation,
+                                                          bool effectInterpolation,
                                                           double maximumWorldEntityDistance,
                                                           double maximumWorldEntityAngle,
                                                           bool mouseInterpolation,
@@ -658,6 +663,7 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
             !EnvironmentEntryHasName(entry, L"PREYHFR_VIEWMODEL_ANIM_INTERP") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_WORLD_INTERP") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_WORLD_ANIM_INTERP") &&
+            !EnvironmentEntryHasName(entry, L"PREYHFR_EFFECT_INTERP") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_WORLD_MAX_DISTANCE") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_WORLD_MAX_ANGLE") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_MOUSE_INTERP") &&
@@ -688,6 +694,8 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                       (worldInterpolation ? L"1" : L"0"));
     entries.push_back(std::wstring(L"PREYHFR_WORLD_ANIM_INTERP=") +
                       (worldAnimationInterpolation ? L"1" : L"0"));
+    entries.push_back(std::wstring(L"PREYHFR_EFFECT_INTERP=") +
+                      (effectInterpolation ? L"1" : L"0"));
     entries.push_back(L"PREYHFR_WORLD_MAX_DISTANCE=" +
                       std::to_wstring(maximumWorldEntityDistance));
     entries.push_back(L"PREYHFR_WORLD_MAX_ANGLE=" +
@@ -1123,6 +1131,10 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
             options.worldAnimationInterpolation = true;
         } else if (argument == L"--no-world-anim-interp") {
             options.worldAnimationInterpolation = false;
+        } else if (argument == L"--effects-interp") {
+            options.effectInterpolation = true;
+        } else if (argument == L"--no-effects-interp") {
+            options.effectInterpolation = false;
         } else if (argument == L"--world-max-distance" && index + 1 < argc) {
             std::size_t parsed = 0;
             options.maximumWorldEntityDistance = std::stod(argv[++index], &parsed);
@@ -1222,6 +1234,7 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
                            L"[--viewmodel-interp] [--world-interp] "
                            L"[--viewmodel-anim-interp] "
                            L"[--world-anim-interp] "
+                           L"[--effects-interp|--no-effects-interp] "
                            L"[--world-max-distance N] [--world-max-angle N] "
                            L"[--mouse-interp] "
                            L"[--continuous-snapshot-timing] "
@@ -1256,6 +1269,10 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
     if (options.worldAnimationInterpolation &&
         !options.cameraInterpolation) {
         std::wcerr << L"--world-anim-interp requires --camera-interp.\n";
+        return std::nullopt;
+    }
+    if (options.effectInterpolation && !options.cameraInterpolation) {
+        std::wcerr << L"Effect interpolation requires --camera-interp.\n";
         return std::nullopt;
     }
     if (options.mouseInterpolation && !options.cameraInterpolation) {
@@ -2094,6 +2111,7 @@ int Run(const Options& options) {
                                                  options.viewModelAnimationInterpolation,
                                                  options.worldInterpolation,
                                                  options.worldAnimationInterpolation,
+                                                 options.effectInterpolation,
                                                  options.maximumWorldEntityDistance,
                                                  options.maximumWorldEntityAngle,
                                                  options.mouseInterpolation,
@@ -2167,6 +2185,8 @@ int Run(const Options& options) {
                   << (options.worldAnimationInterpolation
                           ? "enabled"
                           : "disabled")
+                  << "; effect interpolation is "
+                  << (options.effectInterpolation ? "enabled" : "disabled")
                   << "; mouse interpolation is "
                   << (options.mouseInterpolation ? "enabled" : "disabled")
                   << "; continuous snapshot timing is "
@@ -2406,6 +2426,8 @@ int wmain(int argc, wchar_t** argv) {
                       << (options->worldInterpolation ? "on" : "off")
                       << "; world_animation="
                       << (options->worldAnimationInterpolation ? "on" : "off")
+                      << "; effects="
+                      << (options->effectInterpolation ? "on" : "off")
                       << "; mouse="
                       << (options->mouseInterpolation ? "on" : "off")
                       << "; continuous_snapshot_timing="

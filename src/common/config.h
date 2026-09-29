@@ -33,6 +33,7 @@ struct Config {
     bool viewModelAnimationInterpolation = false;
     bool worldInterpolation = false;
     bool worldAnimationInterpolation = false;
+    bool effectInterpolation = false;
     double maximumWorldEntityDistance = 128.0;
     double maximumWorldEntityAngle = 90.0;
     bool mouseInterpolation = false;
