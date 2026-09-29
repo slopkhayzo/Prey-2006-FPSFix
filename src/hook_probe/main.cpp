@@ -92,10 +92,11 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     const fs::path directory = executable->parent_path();
-    const fs::path hook = directory / L"PreyHFRHook.dll";
+    const fs::path hook = directory / L"PreyHFR.asi";
     const fs::path log = directory / (L"PreyHFRHookProbe-" + std::to_wstring(cap) +
                                       L".log");
     DeleteFileW(log.c_str());
+    SetEnvironmentVariableW(L"PREYHFR_PROBE", L"1");
     SetEnvironmentVariableW(L"PREYHFR_CAP", std::to_wstring(cap).c_str());
     SetEnvironmentVariableW(L"PREYHFR_LOG", log.c_str());
     SetEnvironmentVariableW(L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING", L"1");

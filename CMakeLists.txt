@@ -39,13 +39,35 @@ target_include_directories(PreyHFRLauncher PRIVATE
     "${CMAKE_BINARY_DIR}/generated"
 )
 
-add_library(PreyHFRHook SHARED
+add_library(PreyHFRCommon STATIC
+    src/common/config.cpp
+    src/common/integrity.cpp
+)
+
+target_include_directories(PreyHFRCommon PUBLIC
+    src/common
+)
+
+add_library(PreyHFR SHARED
     src/hook/dllmain.cpp
+    src/hook/wait_gate_patch.cpp
+)
+
+target_include_directories(PreyHFR PRIVATE
+    src/common
+    src/hook
+    "${CMAKE_BINARY_DIR}/generated"
 )
 
 add_executable(PreyHFRHookProbe
     src/hook_probe/main.cpp
 )
+
+add_executable(PreyHFRConfigTest
+    src/config_test/main.cpp
+)
+
+target_link_libraries(PreyHFRConfigTest PRIVATE PreyHFRCommon)
 
 target_compile_definitions(PreyRuntimeDump PRIVATE
     NOMINMAX
@@ -61,7 +83,14 @@ target_compile_definitions(PreyHFRLauncher PRIVATE
     WIN32_LEAN_AND_MEAN
 )
 
-target_compile_definitions(PreyHFRHook PRIVATE
+target_compile_definitions(PreyHFRCommon PRIVATE
+    NOMINMAX
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+)
+
+target_compile_definitions(PreyHFR PRIVATE
     NOMINMAX
     UNICODE
     _UNICODE
@@ -69,6 +98,13 @@ target_compile_definitions(PreyHFRHook PRIVATE
 )
 
 target_compile_definitions(PreyHFRHookProbe PRIVATE
+    NOMINMAX
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+)
+
+target_compile_definitions(PreyHFRConfigTest PRIVATE
     NOMINMAX
     UNICODE
     _UNICODE
@@ -87,7 +123,13 @@ target_compile_options(PreyHFRLauncher PRIVATE
     /EHsc
 )
 
-target_compile_options(PreyHFRHook PRIVATE
+target_compile_options(PreyHFRCommon PRIVATE
+    /W4
+    /permissive-
+    /EHsc
+)
+
+target_compile_options(PreyHFR PRIVATE
     /W4
     /permissive-
     /EHsc
@@ -99,9 +141,16 @@ target_compile_options(PreyHFRHookProbe PRIVATE
     /EHsc
 )
 
+target_compile_options(PreyHFRConfigTest PRIVATE
+    /W4
+    /permissive-
+    /EHsc
+)
+
 target_link_libraries(PreyRuntimeDump PRIVATE bcrypt)
 target_link_libraries(PreyHFRLauncher PRIVATE bcrypt)
-target_link_libraries(PreyHFRHook PRIVATE winmm)
+target_link_libraries(PreyHFRCommon PRIVATE bcrypt)
+target_link_libraries(PreyHFR PRIVATE PreyHFRCommon winmm)
 target_link_libraries(PreyHFRHookProbe PRIVATE gdi32)
 
 set_target_properties(PreyRuntimeDump PROPERTIES
@@ -112,15 +161,22 @@ set_target_properties(PreyHFRLauncher PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-set_target_properties(PreyHFRHook PROPERTIES
+set_target_properties(PreyHFR PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    PREFIX ""
+    OUTPUT_NAME "PreyHFR"
+    SUFFIX ".asi"
 )
 
 set_target_properties(PreyHFRHookProbe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-install(TARGETS PreyHFRLauncher PreyHFRHook
+set_target_properties(PreyHFRConfigTest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+install(TARGETS PreyHFR
     RUNTIME DESTINATION .
     LIBRARY DESTINATION .
 )
@@ -151,7 +207,7 @@ add_custom_target(PreyHFRRelease
             -DPACKAGE_DIR=${PREYHFR_STAGE_DIR}
             -DEXPECTED_VERSION=${PREYHFR_PACKAGE_VERSION}
             -P "${CMAKE_SOURCE_DIR}/cmake/VerifyRelease.cmake"
-    DEPENDS PreyHFRLauncher PreyHFRHook
+    DEPENDS PreyHFR
     COMMENT "Staging and verifying PreyHFR ${PREYHFR_PACKAGE_VERSION}"
     VERBATIM
 )
@@ -159,9 +215,7 @@ add_custom_target(PreyHFRRelease
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME PreyHFRConfigValidation
-        COMMAND PreyHFRLauncher
-                --config "${CMAKE_SOURCE_DIR}/PreyHFR.ini"
-                --validate-config
+        COMMAND PreyHFRConfigTest "${CMAKE_SOURCE_DIR}/PreyHFR.ini"
     )
     add_test(NAME PreyHFRHookProbe144
         COMMAND PreyHFRHookProbe 144 2
@@ -266,5 +320,25 @@ add_custom_target(PreyHFRPackage
             -P "${CMAKE_SOURCE_DIR}/cmake/VerifyReleaseArchive.cmake"
     DEPENDS PreyHFRRelease
     COMMENT "Creating and verifying ${PREYHFR_BINARY_PACKAGE_FILE_NAME}.zip"
+    VERBATIM
+)
+
+set(PREYHFR_LOADER_BUNDLE_DIR
+    "${CMAKE_BINARY_DIR}/release/PreyHFR-${PREYHFR_PACKAGE_VERSION}-windows-x86-with-loader")
+set(PREYHFR_LOADER_BUNDLE_ARCHIVE
+    "${PREYHFR_LOADER_BUNDLE_DIR}.zip")
+add_custom_target(PreyHFRBundlePackage
+    COMMAND "${CMAKE_COMMAND}"
+            -DPLUGIN_DIR=${PREYHFR_STAGE_DIR}
+            -DBUNDLE_DIR=${PREYHFR_LOADER_BUNDLE_DIR}
+            -DARCHIVE=${PREYHFR_LOADER_BUNDLE_ARCHIVE}
+            -DLOADER_BINARY=${CMAKE_SOURCE_DIR}/vendor/ultimate-asi-loader/dinput.dll
+            -DLOADER_CONFIG=${CMAKE_SOURCE_DIR}/packaging/dinput.ini
+            -DLOADER_LICENSE=${CMAKE_SOURCE_DIR}/vendor/ultimate-asi-loader/LICENSE.txt
+            -DLOADER_NOTICE=${CMAKE_SOURCE_DIR}/vendor/ultimate-asi-loader/NOTICE.txt
+            -DEXPECTED_VERSION=${PREYHFR_PACKAGE_VERSION}
+            -P "${CMAKE_SOURCE_DIR}/cmake/CreateLoaderBundle.cmake"
+    DEPENDS PreyHFRRelease
+    COMMENT "Creating loader-inclusive ${PREYHFR_BINARY_PACKAGE_FILE_NAME} bundle"
     VERBATIM
 )

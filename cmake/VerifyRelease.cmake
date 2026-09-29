@@ -8,8 +8,7 @@ if(NOT DEFINED EXPECTED_VERSION OR EXPECTED_VERSION STREQUAL "")
 endif()
 
 set(_payload_files
-    "PreyHFRLauncher.exe"
-    "PreyHFRHook.dll"
+    "PreyHFR.asi"
     "PreyHFR.ini"
     "uninstall-preyhfr.cmd"
     "PreyHFR-README.txt"
@@ -97,35 +96,8 @@ function(require_x86_pe relative_path)
     endif()
 endfunction()
 
-require_x86_pe("PreyHFRLauncher.exe")
-require_x86_pe("PreyHFRHook.dll")
-
-execute_process(
-    COMMAND "${PACKAGE_DIR}/PreyHFRLauncher.exe" --version
-    WORKING_DIRECTORY "${PACKAGE_DIR}"
-    RESULT_VARIABLE _version_result
-    OUTPUT_VARIABLE _version_output
-    ERROR_VARIABLE _version_error
-)
-if(NOT _version_result EQUAL 0 OR
-   NOT _version_output MATCHES "PreyHFR ${EXPECTED_VERSION}")
-    message(FATAL_ERROR
-        "Packaged launcher version check failed: ${_version_output}${_version_error}")
-endif()
-
-execute_process(
-    COMMAND "${PACKAGE_DIR}/PreyHFRLauncher.exe" --validate-config
-    WORKING_DIRECTORY "${PACKAGE_DIR}"
-    RESULT_VARIABLE _config_result
-    OUTPUT_VARIABLE _config_output
-    ERROR_VARIABLE _config_error
-)
-if(NOT _config_result EQUAL 0 OR
-   NOT _config_output MATCHES "Configuration is valid")
-    message(FATAL_ERROR
-        "Packaged configuration check failed: ${_config_output}${_config_error}")
-endif()
+require_x86_pe("PreyHFR.asi")
 
 message(STATUS
     "Verified PreyHFR ${EXPECTED_VERSION}: exact payload, SHA-256 manifest, "
-    "x86 PE images, launcher identity, and default configuration")
+    "x86 ASI image, and supported retail-build identity")

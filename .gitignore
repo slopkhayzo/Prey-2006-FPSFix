@@ -35,6 +35,7 @@ compile_commands.json
 # Compiled and packaged artifacts
 *.exe
 *.dll
+!vendor/ultimate-asi-loader/dinput.dll
 *.lib
 *.exp
 *.ilk

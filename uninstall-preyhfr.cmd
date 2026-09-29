@@ -6,8 +6,7 @@ echo Removing PreyHFR release files from:
 echo   %CD%
 
 for %%F in (
-    "PreyHFRLauncher.exe"
-    "PreyHFRHook.dll"
+    "PreyHFR.asi"
     "PreyHFR.ini"
     "PreyHFR-release.json"
     "PreyHFR.log"

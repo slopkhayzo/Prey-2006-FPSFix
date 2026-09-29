@@ -416,7 +416,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         return false;
     }
 
-    const std::array<std::string_view, 18> knownKeys{
+    const std::array<std::string_view, 22> knownKeys{
         "patch.enabled", "patch.presentation_fps", "patch.simulation_hz",
         "interpolation.enabled", "interpolation.camera",
         "interpolation.viewmodel", "interpolation.viewmodel_animation",
@@ -426,13 +426,14 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
         "compatibility.overdue_snapshot_fallback",
-        "diagnostics.interpolation_trace", "diagnostics.timeline_reset_key",
-        "display.borderless",
+        "diagnostics.view_log", "diagnostics.interpolation_trace",
+        "diagnostics.timeline_reset_key", "display.borderless",
+        "display.mode", "display.vsync", "display.resolution",
     };
     for (const auto& [key, entry] : values) {
         const bool known = std::find(knownKeys.begin(), knownKeys.end(), key) !=
                            knownKeys.end();
-        if (!known && key != "display.resolution") {
+        if (!known) {
             error = "unknown key " + key + " at line " +
                     std::to_string(entry.second);
             return false;
@@ -506,6 +507,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
                      options.multiTicEntityAlignment) ||
         !readBoolean("compatibility.overdue_snapshot_fallback",
                      options.overdueSnapshotFallback) ||
+        !readBoolean("diagnostics.view_log", options.viewLog) ||
         !readBoolean("diagnostics.interpolation_trace",
                      options.interpolationTrace) ||
         !readBoolean("display.borderless", options.borderless)) {
@@ -549,20 +551,62 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         return false;
     }
 
+    const auto displayMode = values.find("display.mode");
+    if (displayMode != values.end()) {
+        const std::string normalized =
+            LowerAscii(Trim(displayMode->second.first));
+        if (normalized == "game" || normalized == "default" ||
+            normalized == "game_default") {
+            options.displayMode = DisplayMode::Unspecified;
+        } else if (normalized == "windowed" || normalized == "window") {
+            options.displayMode = DisplayMode::Windowed;
+        } else if (normalized == "exclusive" || normalized == "fullscreen") {
+            options.displayMode = DisplayMode::Exclusive;
+        } else {
+            error = "display.mode must be game, windowed, or exclusive at line " +
+                    std::to_string(displayMode->second.second);
+            return false;
+        }
+    }
+    const auto vSync = values.find("display.vsync");
+    if (vSync != values.end()) {
+        const std::string normalized = LowerAscii(Trim(vSync->second.first));
+        if (normalized.empty() || normalized == "game" ||
+            normalized == "default" || normalized == "game_default") {
+            options.vSync.reset();
+        } else if (normalized == "on" || normalized == "true" ||
+                   normalized == "1") {
+            options.vSync = true;
+        } else if (normalized == "off" || normalized == "false" ||
+                   normalized == "0") {
+            options.vSync = false;
+        } else {
+            error = "display.vsync must be game, on, or off at line " +
+                    std::to_string(vSync->second.second);
+            return false;
+        }
+    }
+
     const auto resolution = values.find("display.resolution");
-    if (resolution != values.end() && !resolution->second.first.empty() &&
-        LowerAscii(resolution->second.first) != "desktop") {
+    const std::string normalizedResolution =
+        resolution == values.end()
+            ? std::string{}
+            : LowerAscii(Trim(resolution->second.first));
+    if (resolution != values.end() && !normalizedResolution.empty() &&
+        normalizedResolution != "desktop" && normalizedResolution != "game" &&
+        normalizedResolution != "default" &&
+        normalizedResolution != "game_default") {
         std::wstring wideValue(resolution->second.first.begin(),
                                resolution->second.first.end());
         options.resolution = ParseResolution(wideValue);
         if (!options.resolution) {
-            error = "display.resolution must be blank, desktop, or WIDTHxHEIGHT at line " +
+            error = "display.resolution must be blank, game, desktop, or WIDTHxHEIGHT at line " +
                     std::to_string(resolution->second.second);
             return false;
         }
     }
     if (resolution != values.end() &&
-        LowerAscii(resolution->second.first) == "desktop") {
+        normalizedResolution == "desktop") {
         options.borderless = true;
     }
     return true;

@@ -1,16 +1,28 @@
 #include <windows.h>
 #include <mmsystem.h>
 
+#include "config.h"
+#include "integrity.h"
+#include "preyhfr_version.h"
+#include "wait_gate_patch.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <filesystem>
+#include <optional>
+#include <sstream>
 #include <intrin.h>
 #include <string>
+#include <thread>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -29,6 +41,9 @@ using GetDirectUsercmdFn = void*(__thiscall*)(void*, void*);
 using DirectInputCreateAFn = HRESULT(WINAPI*)(HINSTANCE, DWORD, void**, void*);
 using DirectInputCreateDeviceFn = HRESULT(WINAPI*)(void*, REFGUID, void**, void*);
 using DirectInputGetDeviceDataFn = HRESULT(WINAPI*)(void*, DWORD, void*, DWORD*, DWORD);
+using SetCVarStringFn = void(__thiscall*)(void*, const char*, const char*, int);
+using SetCVarBoolFn = void(__thiscall*)(void*, const char*, bool, int);
+using SetCVarIntegerFn = void(__thiscall*)(void*, const char*, int, int);
 
 constexpr std::uintptr_t kSingleViewRva = 0x001a8de0;
 constexpr std::uintptr_t kDetermineViewAnglesRva = 0x00195730;
@@ -37,6 +52,10 @@ constexpr std::uintptr_t kMouseMoveRva = 0x00069000;
 constexpr std::uintptr_t kUsercmdTicCmdRva = 0x00068ba0;
 constexpr std::uintptr_t kUsercmdInterruptRva = 0x00069880;
 constexpr std::uintptr_t kGetDirectUsercmdRva = 0x00069970;
+constexpr std::uintptr_t kCvarSystemVtableRva = 0x003af26c;
+constexpr std::uintptr_t kSetCVarStringRva = 0x0002db00;
+constexpr std::uintptr_t kSetCVarBoolRva = 0x0002db10;
+constexpr std::uintptr_t kSetCVarIntegerRva = 0x0002db90;
 constexpr std::uintptr_t kRunGameTicRvaBegin = 0x0005c670;
 constexpr std::uintptr_t kRunGameTicRvaEnd = 0x0005cf00;
 constexpr std::uintptr_t kSensitivityCvarPointerRva = 0x0044298c;
@@ -69,6 +88,10 @@ constexpr std::size_t kRenderEntityLocalPrefixSize = sizeof(void*);
 constexpr std::size_t kRenderEntityLocalValidationSize = 0x17c;
 constexpr std::int32_t kNativeTicMilliseconds = 16;
 constexpr std::int32_t kMaximumInterpolatedCameraIntervalMilliseconds = 32;
+constexpr std::int32_t kCameraPhaseRecoveryEnterMilliseconds = 8;
+constexpr std::int32_t kCameraPhaseRecoveryExitMilliseconds = 2;
+constexpr std::int32_t kCameraPhaseRecoveryDebounceMilliseconds = 96;
+constexpr double kCameraPhaseRecoverySlewFraction = 0.25;
 constexpr double kNativeTicSeconds = 0.016;
 constexpr double kMaximumCameraStep = 32.0;
 constexpr double kMaximumCameraAngleDegrees = 45.0;
@@ -109,6 +132,29 @@ constexpr GUID kSystemMouseGuid{
 
 SwapBuffersFn g_originalSwapBuffers = nullptr;
 IMAGE_THUNK_DATA32* g_swapBuffersThunk = nullptr;
+HMODULE g_pluginModule = nullptr;
+bool g_probeMode = false;
+std::atomic<bool> g_patchActive{false};
+std::atomic<bool> g_initializationComplete{false};
+preyhfr::WaitGatePatch g_waitGatePatch;
+void** g_setCVarStringSlot = nullptr;
+void** g_setCVarBoolSlot = nullptr;
+void** g_setCVarIntegerSlot = nullptr;
+SetCVarStringFn g_originalSetCVarString = nullptr;
+SetCVarBoolFn g_originalSetCVarBool = nullptr;
+SetCVarIntegerFn g_originalSetCVarInteger = nullptr;
+// 0 = waiting, 1 = applying, 2 = applied, 3 = first presentation was too early.
+std::atomic<int> g_displayOverrideStartupState{0};
+// 0 = pending, 1 = every supported retail file validated, 2 = rejected.
+std::atomic<int> g_retailValidationState{0};
+HANDLE g_retailValidationEvent = nullptr;
+std::uintptr_t g_comTicNumberAddress = 0;
+bool g_displayCvarHooksInstalled = false;
+std::optional<int> g_requestedMode;
+std::optional<int> g_requestedFullscreen;
+std::optional<int> g_requestedSwapInterval;
+std::optional<int> g_requestedCustomWidth;
+std::optional<int> g_requestedCustomHeight;
 LARGE_INTEGER g_frequency{};
 std::int64_t g_periodCounts = 0;
 std::int64_t g_nextDeadline = 0;
@@ -202,7 +248,7 @@ struct MouseObjectData {
     DWORD sequence = 0;
 };
 
-static_assert(sizeof(void*) == 4, "PreyHFRHook must be built for x86");
+static_assert(sizeof(void*) == 4, "PreyHFR must be built for x86");
 static_assert(sizeof(MouseObjectData) == 16,
               "Retail DirectInput object data is expected to be 16 bytes");
 
@@ -227,6 +273,25 @@ struct MouseCounters {
 };
 
 MouseCounters g_mouseCounters{};
+
+struct MouseFrameProbe {
+    double trackedYaw = 0.0;
+    double trackedPitch = 0.0;
+    double totalYaw = 0.0;
+    double totalPitch = 0.0;
+    double transitionYaw = 0.0;
+    double transitionPitch = 0.0;
+    std::uint64_t latestSerial = 0;
+    std::uint64_t includedSerialBefore = 0;
+    std::uint64_t includedSerialAfter = 0;
+    std::uint64_t selectedSerial = 0;
+    int peekDeltaX = 0;
+    int peekDeltaY = 0;
+    bool tracked = false;
+    bool peeked = false;
+};
+
+MouseFrameProbe g_mouseFrameProbe{};
 
 struct MouseDeltaRecord {
     std::uint64_t serial = 0;
@@ -338,6 +403,8 @@ std::int64_t g_cameraCurrentQpc = 0;
 std::int64_t g_lastCameraCallQpc = 0;
 std::int32_t g_cameraCurrentIntervalMilliseconds = kNativeTicMilliseconds;
 bool g_cameraTimelineSynchronized = false;
+bool g_cameraPhaseRecoveryActive = false;
+std::int64_t g_cameraPhaseRecoveryCandidateQpc = 0;
 std::uint64_t g_cameraSnapshotGeneration = 0;
 
 struct ViewEntityPose {
@@ -909,12 +976,15 @@ bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
     const auto viewTime = ReadUnaligned<std::int32_t>(view, 80);
     AcquireSRWLockExclusive(&g_mouseLedgerLock);
     const std::uint64_t latest = g_latestMouseSerial;
+    g_mouseFrameProbe.latestSerial = latest;
+    g_mouseFrameProbe.includedSerialBefore = g_includedMouseSerial;
     bool valid = true;
     if (!g_haveMouseViewTime || viewTime != g_mouseViewTime) {
         std::uint64_t selected =
             g_selectedMouseSerial.load(std::memory_order_acquire);
         selected = std::min(selected, latest);
         selected = std::max(selected, g_includedMouseSerial);
+        g_mouseFrameProbe.selectedSerial = selected;
         double incorporatedYaw = 0.0;
         double incorporatedPitch = 0.0;
         if (selected > g_includedMouseSerial) {
@@ -958,6 +1028,9 @@ bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
         pitch = 0.0;
         ++g_mouseCounters.ledgerOverflows;
     }
+    g_mouseFrameProbe.includedSerialAfter = g_includedMouseSerial;
+    g_mouseFrameProbe.transitionYaw = g_mouseTransitionYaw;
+    g_mouseFrameProbe.transitionPitch = g_mouseTransitionPitch;
     ReleaseSRWLockExclusive(&g_mouseLedgerLock);
     return valid && (yaw != 0.0 || pitch != 0.0);
 }
@@ -1119,6 +1192,7 @@ bool ApplyPendingMouseOverlay(const void* baseView,
                               double basePitch,
                               bool basePitchValid,
                               MouseOverlay& overlay) {
+    g_mouseFrameProbe = {};
     if (!g_mouseInterpolationRequested || baseView == nullptr) return false;
 
     double trackedYaw = 0.0;
@@ -1126,12 +1200,18 @@ bool ApplyPendingMouseOverlay(const void* baseView,
     const bool tracked = GetTrackedMouseOverlay(
         authoritativeView, interpolationAlpha, temporaryInitialized, trackedYaw,
         trackedPitch);
+    g_mouseFrameProbe.tracked = tracked;
+    g_mouseFrameProbe.trackedYaw = trackedYaw;
+    g_mouseFrameProbe.trackedPitch = trackedPitch;
     double yaw = trackedYaw;
     double pitch = trackedPitch;
 
     int deltaX = 0;
     int deltaY = 0;
     const bool peeked = PeekPendingMouse(deltaX, deltaY);
+    g_mouseFrameProbe.peeked = peeked;
+    g_mouseFrameProbe.peekDeltaX = deltaX;
+    g_mouseFrameProbe.peekDeltaY = deltaY;
 
     void* usercmd = g_usercmdGenerator.load(std::memory_order_acquire);
     if (peeked) {
@@ -1177,6 +1257,8 @@ bool ApplyPendingMouseOverlay(const void* baseView,
         ++g_mouseCounters.skippedState;
         return false;
     }
+    g_mouseFrameProbe.totalYaw = yaw;
+    g_mouseFrameProbe.totalPitch = pitch;
     if (yaw == 0.0 && pitch == 0.0) return false;
 
     if (!basePitchValid) {
@@ -1311,6 +1393,20 @@ void ResetTrackedEntityInterpolation() {
 }
 
 void ResetPresentationTimelineManually() {
+    std::uint64_t latestMouseSerial = 0;
+    std::uint64_t includedMouseSerial = 0;
+    const std::uint64_t selectedMouseSerial =
+        g_selectedMouseSerial.load(std::memory_order_acquire);
+    AcquireSRWLockShared(&g_mouseLedgerLock);
+    latestMouseSerial = g_latestMouseSerial;
+    includedMouseSerial = g_includedMouseSerial;
+    ReleaseSRWLockShared(&g_mouseLedgerLock);
+    const std::int32_t comTicNumber = g_comTicNumberAddress != 0
+        ? *reinterpret_cast<volatile const std::int32_t*>(
+              g_comTicNumberAddress)
+        : -1;
+    const std::int32_t previousViewTime =
+        g_havePreviousView ? g_previousViewTime : -1;
     g_haveCameraCurrent = false;
     g_canInterpolateCamera = false;
     g_cameraPreviousPitchValid = false;
@@ -1319,6 +1415,8 @@ void ResetPresentationTimelineManually() {
     g_lastCameraCallQpc = 0;
     g_cameraCurrentIntervalMilliseconds = kNativeTicMilliseconds;
     g_cameraTimelineSynchronized = false;
+    g_cameraPhaseRecoveryActive = false;
+    g_cameraPhaseRecoveryCandidateQpc = 0;
     g_havePreviousView = false;
     g_haveMouseViewTime = false;
     g_mouseTransitionYaw = 0.0;
@@ -1327,11 +1425,17 @@ void ResetPresentationTimelineManually() {
 
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
-    char buffer[192]{};
+    char buffer[320]{};
     const int length = _snprintf_s(
         buffer, sizeof(buffer), _TRUNCATE,
-        "camera: presentation timeline manually reset; qpc=%lld key_vk=0x%02x\r\n",
-        static_cast<long long>(now.QuadPart), g_timelineResetVirtualKey);
+        "camera: presentation timeline manually reset; qpc=%lld key_vk=0x%02x "
+        "com_tic=%d view_time=%d mouse_serial_latest=%llu "
+        "mouse_serial_included=%llu mouse_serial_selected=%llu\r\n",
+        static_cast<long long>(now.QuadPart), g_timelineResetVirtualKey,
+        comTicNumber, previousViewTime,
+        static_cast<unsigned long long>(latestMouseSerial),
+        static_cast<unsigned long long>(includedMouseSerial),
+        static_cast<unsigned long long>(selectedMouseSerial));
     if (length > 0) {
         LogPresentationEvent(
             std::string(buffer, static_cast<std::size_t>(length)));
@@ -1837,6 +1941,13 @@ double EntityInterpolationAlpha(bool pending, std::uint32_t transitionSamples,
                                 double pendingTicAlpha,
                                 bool multiTicEntityAlignment,
                                 bool overdueSnapshotFallback);
+double AnimationInterpolationAlpha(bool pending,
+                                   std::uint32_t transitionSamples,
+                                   double cameraAlpha,
+                                   double latestTicAlpha,
+                                   double pendingTicAlpha,
+                                   bool multiTicEntityAlignment,
+                                   bool overdueSnapshotFallback);
 
 std::size_t ApplyInterpolatedRenderEntities(
     int viewId, double cameraAlpha, double latestTicAlpha,
@@ -2018,7 +2129,7 @@ std::size_t ApplyInterpolatedRenderEntities(
             const bool useLatestTicAlpha =
                 g_multiTicEntityAlignmentRequested &&
                 tracked->animation.transitionSamples > 1;
-            const double animationAlpha = EntityInterpolationAlpha(
+            const double animationAlpha = AnimationInterpolationAlpha(
                 pendingAnimation, tracked->animation.transitionSamples,
                 cameraAlpha, latestTicAlpha, pendingTicAlpha,
                 g_multiTicEntityAlignmentRequested,
@@ -2113,6 +2224,91 @@ std::int64_t CameraIntervalQpc(std::int32_t milliseconds,
         static_cast<double>(frequency) / 1000.0));
 }
 
+struct CameraSnapshotClockUpdate {
+    std::int64_t qpc = 0;
+    std::int64_t phaseLagQpc = 0;
+    std::int64_t correctionQpc = 0;
+    bool recoveryStarted = false;
+    bool recoveryFinished = false;
+};
+
+CameraSnapshotClockUpdate UpdateCameraSnapshotClock(
+    std::int64_t currentSnapshotQpc, std::int32_t intervalMilliseconds,
+    std::int64_t previousCallQpc, std::int64_t nowQpc,
+    std::int64_t frequency, bool& recoveryActive,
+    std::int64_t& recoveryCandidateQpc) {
+    CameraSnapshotClockUpdate update;
+    const std::int64_t predictedSnapshotQpc =
+        currentSnapshotQpc +
+        CameraIntervalQpc(intervalMilliseconds, frequency);
+    update.qpc = predictedSnapshotQpc;
+    if (frequency <= 0 || previousCallQpc <= 0 ||
+        previousCallQpc > nowQpc) {
+        return update;
+    }
+
+    // A changed render view was produced between the previous and current
+    // presentation calls. Its midpoint is a bounded phase observation; unlike
+    // the current call time, it does not include the whole sampling delay.
+    const std::int64_t observedSnapshotQpc =
+        previousCallQpc + (nowQpc - previousCallQpc) / 2;
+    update.phaseLagQpc = observedSnapshotQpc - predictedSnapshotQpc;
+
+    // A prediction later than the observation cannot represent a snapshot
+    // already in hand. Moving this boundary earlier only advances the
+    // presentation timeline, so it is safe and also removes initial sampling
+    // error at commensurate rates such as 60 and 120 Hz.
+    if (predictedSnapshotQpc > nowQpc) {
+        update.qpc = nowQpc;
+        update.correctionQpc = nowQpc - predictedSnapshotQpc;
+        update.recoveryFinished = recoveryActive;
+        recoveryActive = false;
+        recoveryCandidateQpc = 0;
+        return update;
+    }
+
+    const std::int64_t enterQpc = CameraIntervalQpc(
+        kCameraPhaseRecoveryEnterMilliseconds, frequency);
+    const std::int64_t exitQpc = CameraIntervalQpc(
+        kCameraPhaseRecoveryExitMilliseconds, frequency);
+    if (!recoveryActive) {
+        if (update.phaseLagQpc <= enterQpc) {
+            recoveryCandidateQpc = 0;
+            return update;
+        }
+        if (recoveryCandidateQpc == 0) {
+            recoveryCandidateQpc = nowQpc;
+            return update;
+        }
+        const std::int64_t debounceQpc = CameraIntervalQpc(
+            kCameraPhaseRecoveryDebounceMilliseconds, frequency);
+        if (nowQpc - recoveryCandidateQpc < debounceQpc) return update;
+        recoveryActive = true;
+        recoveryCandidateQpc = 0;
+        update.recoveryStarted = true;
+    }
+    if (update.phaseLagQpc <= exitQpc) {
+        recoveryActive = false;
+        recoveryCandidateQpc = 0;
+        update.recoveryFinished = true;
+        return update;
+    }
+
+    // Correct only a fraction of one presentation interval at a time. The
+    // presented game-time advance across this snapshot remains positive, so
+    // camera and viewmodel motion cannot perform the captured alpha-to-zero
+    // rollback. Repeated snapshots still converge the clock back into phase.
+    const std::int64_t callGapQpc = nowQpc - previousCallQpc;
+    const std::int64_t maximumCorrectionQpc = (std::max)(
+        std::int64_t{1}, static_cast<std::int64_t>(std::llround(
+            static_cast<double>(callGapQpc) *
+            kCameraPhaseRecoverySlewFraction)));
+    update.correctionQpc = (std::min)(
+        update.phaseLagQpc - exitQpc, maximumCorrectionQpc);
+    update.qpc += update.correctionQpc;
+    return update;
+}
+
 bool CameraSnapshotClockDebtExceeded(std::int64_t currentSnapshotQpc,
                                      std::int32_t nextIntervalMilliseconds,
                                      std::int32_t maximumDebtMilliseconds,
@@ -2162,6 +2358,15 @@ double CameraInterpolationAlpha(std::int32_t intervalMilliseconds,
         g_overdueSnapshotFallbackRequested);
 }
 
+double CameraRotationInterpolationAlpha(double interpolationAlpha) {
+    // Positional extrapolation keeps continuous movement useful while an
+    // async tic is late.  Reusing the previous angular velocity is unsafe,
+    // however: live mouse deltas already describe rotation after the newest
+    // snapshot, so angular extrapolation counts a fast turn twice and snaps
+    // back when the next authoritative view arrives.
+    return std::clamp(interpolationAlpha, 0.0, 1.0);
+}
+
 double LatestNativeTicInterpolationAlphaForMode(
     std::int64_t nowQpc, std::int64_t currentSnapshotQpc,
     std::int64_t frequency, bool overdueSnapshotFallback) {
@@ -2205,6 +2410,24 @@ double EntityInterpolationAlpha(bool pending, std::uint32_t transitionSamples,
     return cameraAlpha;
 }
 
+double AnimationInterpolationAlpha(bool pending,
+                                   std::uint32_t transitionSamples,
+                                   double cameraAlpha,
+                                   double latestTicAlpha,
+                                   double pendingTicAlpha,
+                                   bool multiTicEntityAlignment,
+                                   bool overdueSnapshotFallback) {
+    // One native tic of prediction is required to bridge the engine's regular
+    // paired-tic catch-ups.  The upstream cadence functions already bound the
+    // value to that horizon; keep a final defensive bound here as well.
+    return std::clamp(
+        EntityInterpolationAlpha(
+            pending, transitionSamples, cameraAlpha, latestTicAlpha,
+            pendingTicAlpha, multiTicEntityAlignment,
+            overdueSnapshotFallback),
+        0.0, 2.0);
+}
+
 bool BuildInterpolatedView(const void* view,
                            std::array<std::uint8_t, kRenderViewSize>& temporary,
                            double& interpolationAlpha,
@@ -2240,12 +2463,15 @@ bool BuildInterpolatedView(const void* view,
         g_lastCameraCallQpc = now.QuadPart;
         g_cameraCurrentIntervalMilliseconds = kNativeTicMilliseconds;
         g_cameraTimelineSynchronized = false;
+        g_cameraPhaseRecoveryActive = false;
+        g_cameraPhaseRecoveryCandidateQpc = 0;
         ResetTrackedEntityInterpolation();
         ++g_viewCounters.snappedViews;
         return false;
     }
 
-    const double callGap = static_cast<double>(now.QuadPart - g_lastCameraCallQpc) /
+    const std::int64_t previousCallQpc = g_lastCameraCallQpc;
+    const double callGap = static_cast<double>(now.QuadPart - previousCallQpc) /
                            static_cast<double>(g_frequency.QuadPart);
     g_cameraFrameProbe.callGapMilliseconds = callGap * 1000.0;
     g_lastCameraCallQpc = now.QuadPart;
@@ -2260,6 +2486,8 @@ bool BuildInterpolatedView(const void* view,
         g_cameraCurrentQpc = now.QuadPart;
         g_cameraCurrentIntervalMilliseconds = kNativeTicMilliseconds;
         g_cameraTimelineSynchronized = false;
+        g_cameraPhaseRecoveryActive = false;
+        g_cameraPhaseRecoveryCandidateQpc = 0;
         ResetTrackedEntityInterpolation();
         ++g_viewCounters.interpolationResets;
         ++g_viewCounters.resetStall;
@@ -2333,6 +2561,8 @@ bool BuildInterpolatedView(const void* view,
             g_cameraCurrentQpc = now.QuadPart;
             g_cameraCurrentIntervalMilliseconds = kNativeTicMilliseconds;
             g_cameraTimelineSynchronized = false;
+            g_cameraPhaseRecoveryActive = false;
+            g_cameraPhaseRecoveryCandidateQpc = 0;
             ResetTrackedEntityInterpolation();
             ++g_viewCounters.interpolationResets;
             if (timeDeltaChanged) ++g_viewCounters.resetTimeDelta;
@@ -2368,26 +2598,55 @@ bool BuildInterpolatedView(const void* view,
                 static_cast<std::int32_t>(timeDelta);
             if (g_continuousSnapshotTimingRequested) {
                 if (g_cameraTimelineSynchronized) {
-                    const std::int64_t predictedSnapshotQpc =
-                        g_cameraCurrentQpc + CameraIntervalQpc(
-                        g_cameraCurrentIntervalMilliseconds,
-                        g_frequency.QuadPart);
-                    // The first transition is observed up to one presentation
-                    // late.  Converge toward an earlier observed boundary,
-                    // but never move the established clock forward.
-                    g_cameraCurrentQpc =
-                        (std::min)(predictedSnapshotQpc, now.QuadPart);
+                    const CameraSnapshotClockUpdate clockUpdate =
+                        UpdateCameraSnapshotClock(
+                            g_cameraCurrentQpc,
+                            g_cameraCurrentIntervalMilliseconds,
+                            previousCallQpc, now.QuadPart,
+                            g_frequency.QuadPart,
+                            g_cameraPhaseRecoveryActive,
+                            g_cameraPhaseRecoveryCandidateQpc);
+                    g_cameraCurrentQpc = clockUpdate.qpc;
+                    if (clockUpdate.recoveryStarted ||
+                        clockUpdate.recoveryFinished) {
+                        const double phaseLagMilliseconds =
+                            1000.0 * static_cast<double>(
+                                clockUpdate.phaseLagQpc) /
+                            static_cast<double>(g_frequency.QuadPart);
+                        const double correctionMilliseconds =
+                            1000.0 * static_cast<double>(
+                                clockUpdate.correctionQpc) /
+                            static_cast<double>(g_frequency.QuadPart);
+                        char buffer[288]{};
+                        const int length = _snprintf_s(
+                            buffer, sizeof(buffer), _TRUNCATE,
+                            "camera: presentation timeline phase recovery %s; "
+                            "qpc=%lld view_time=%d view_delta=%lld "
+                            "lag_ms=%.4f correction_ms=%.4f\r\n",
+                            clockUpdate.recoveryStarted ? "started" : "finished",
+                            static_cast<long long>(now.QuadPart), viewTime,
+                            static_cast<long long>(timeDelta),
+                            phaseLagMilliseconds, correctionMilliseconds);
+                        if (length > 0) {
+                            LogPresentationEvent(std::string(
+                                buffer, static_cast<std::size_t>(length)));
+                        }
+                    }
                 } else {
                     // Establish a stable phase, then advance it from the
                     // authoritative simulation timestamps.
                     g_cameraCurrentQpc = now.QuadPart;
                     g_cameraTimelineSynchronized = true;
+                    g_cameraPhaseRecoveryActive = false;
+                    g_cameraPhaseRecoveryCandidateQpc = 0;
                 }
             } else {
                 // RC1 compatibility: restart interpolation when this
                 // presentation call observes each new snapshot.
                 g_cameraCurrentQpc = now.QuadPart;
                 g_cameraTimelineSynchronized = false;
+                g_cameraPhaseRecoveryActive = false;
+                g_cameraPhaseRecoveryCandidateQpc = 0;
             }
         }
     }
@@ -2402,6 +2661,7 @@ bool BuildInterpolatedView(const void* view,
     const double alpha = CameraInterpolationAlpha(
         g_cameraCurrentIntervalMilliseconds, now.QuadPart,
         g_cameraCurrentQpc, g_frequency.QuadPart);
+    const double rotationAlpha = CameraRotationInterpolationAlpha(alpha);
     interpolationAlpha = alpha;
     latestTicAlpha = LatestNativeTicInterpolationAlpha(
         now.QuadPart, g_cameraCurrentQpc, g_frequency.QuadPart);
@@ -2411,7 +2671,8 @@ bool BuildInterpolatedView(const void* view,
     basePitchValid = g_cameraPreviousPitchValid && g_cameraCurrentPitchValid;
     if (basePitchValid) {
         basePitch = g_cameraPreviousPitch +
-                    (g_cameraCurrentPitch - g_cameraPreviousPitch) * alpha;
+                    (g_cameraCurrentPitch - g_cameraPreviousPitch) *
+                        rotationAlpha;
     }
     std::memcpy(temporary.data(), view, temporary.size());
     const auto previousOrigin = ReadOrigin(g_cameraPrevious.data());
@@ -2424,7 +2685,8 @@ bool BuildInterpolatedView(const void* view,
     }
     const Quaternion interpolatedAxis =
         Slerp(MatrixToQuaternion(ReadAxis(g_cameraPrevious.data())),
-              MatrixToQuaternion(ReadAxis(g_cameraCurrent.data())), alpha);
+              MatrixToQuaternion(ReadAxis(g_cameraCurrent.data())),
+              rotationAlpha);
     const auto matrix = QuaternionToMatrix(interpolatedAxis);
     std::memcpy(temporary.data() + 40, matrix.data(), sizeof(matrix));
     ++g_viewCounters.interpolatedViews;
@@ -2493,6 +2755,7 @@ void AppendInterpolationTrace(
     const void* sourceView, const void* presentedView,
     bool cameraInterpolated, bool mouseOverlaid,
     double cameraAlpha, double latestTicAlpha, double pendingTicAlpha,
+    double basePitch,
     std::size_t appliedEntityCount,
     const std::array<AppliedViewEntityPose, kMaximumAppliedEntityPoses>& applied,
     const ViewCounters& beforeEntities) {
@@ -2537,6 +2800,12 @@ void AppendInterpolationTrace(
 
     const auto sourceOrigin = ReadOrigin(sourceView);
     const auto presentedOrigin = ReadOrigin(presentedView);
+    const auto sourceAxis = ReadAxis(sourceView);
+    const auto presentedAxis = ReadAxis(presentedView);
+    const std::int32_t comTicNumber = g_comTicNumberAddress != 0
+        ? *reinterpret_cast<volatile const std::int32_t*>(
+              g_comTicNumberAddress)
+        : -1;
     int viewModelHandle = -1;
     std::array<float, 3> viewModelSourceOrigin{};
     std::array<float, 3> viewModelPresentedOrigin{};
@@ -2568,16 +2837,24 @@ void AppendInterpolationTrace(
         return after - before;
     };
 
-    char line[2048]{};
+    char line[3072]{};
     const int length = _snprintf_s(
         line, sizeof(line), _TRUNCATE,
-        "interp_trace: qpc=%lld view_time=%d camera_prev_time=%d "
+        "interp_trace: qpc=%lld com_tic=%d view_time=%d camera_prev_time=%d "
         "camera_current_time=%d view_delta=%lld call_gap_ms=%.4f "
         "snapshot_qpc=%lld snapshot_age_ms=%.4f interval_ms=%d "
         "generation=%llu reset_mask=0x%02x timeline_sync=%d "
         "can_interpolate=%d camera_applied=%d mouse_applied=%d "
         "alpha=%.6f latest_alpha=%.6f pending_alpha=%.6f "
         "source_origin=%.4f,%.4f,%.4f presented_origin=%.4f,%.4f,%.4f "
+        "source_forward=%.6f,%.6f,%.6f "
+        "presented_forward=%.6f,%.6f,%.6f base_pitch=%.6f "
+        "mouse_yaw=%.6f mouse_pitch=%.6f "
+        "mouse_tracked_yaw=%.6f mouse_tracked_pitch=%.6f "
+        "mouse_transition_yaw=%.6f mouse_transition_pitch=%.6f "
+        "mouse_peek=%d mouse_dx=%d mouse_dy=%d "
+        "mouse_serial_latest=%llu mouse_serial_included_before=%llu "
+        "mouse_serial_included_after=%llu mouse_serial_selected=%llu "
         "viewmodel_handle=%d viewmodel_source_origin=%.4f,%.4f,%.4f "
         "viewmodel_presented_origin=%.4f,%.4f,%.4f "
         "applied_entities=%zu active_entities=%zu "
@@ -2590,7 +2867,7 @@ void AppendInterpolationTrace(
         "frame_viewmodel_latest_anims=%llu frame_world_latest_anims=%llu "
         "frame_viewmodel_pending_anims=%llu frame_world_pending_anims=%llu\r\n",
         static_cast<long long>(g_cameraFrameProbe.qpc),
-        g_cameraFrameProbe.viewTime, previousTime, currentTime,
+        comTicNumber, g_cameraFrameProbe.viewTime, previousTime, currentTime,
         static_cast<long long>(g_cameraFrameProbe.viewDelta),
         g_cameraFrameProbe.callGapMilliseconds,
         static_cast<long long>(g_cameraCurrentQpc), snapshotAgeMilliseconds,
@@ -2602,6 +2879,19 @@ void AppendInterpolationTrace(
         mouseOverlaid ? 1 : 0, cameraAlpha, latestTicAlpha,
         pendingTicAlpha, sourceOrigin[0], sourceOrigin[1], sourceOrigin[2],
         presentedOrigin[0], presentedOrigin[1], presentedOrigin[2],
+        sourceAxis[0], sourceAxis[1], sourceAxis[2], presentedAxis[0],
+        presentedAxis[1], presentedAxis[2], basePitch,
+        g_mouseFrameProbe.totalYaw, g_mouseFrameProbe.totalPitch,
+        g_mouseFrameProbe.trackedYaw, g_mouseFrameProbe.trackedPitch,
+        g_mouseFrameProbe.transitionYaw, g_mouseFrameProbe.transitionPitch,
+        g_mouseFrameProbe.peeked ? 1 : 0, g_mouseFrameProbe.peekDeltaX,
+        g_mouseFrameProbe.peekDeltaY,
+        static_cast<unsigned long long>(g_mouseFrameProbe.latestSerial),
+        static_cast<unsigned long long>(
+            g_mouseFrameProbe.includedSerialBefore),
+        static_cast<unsigned long long>(
+            g_mouseFrameProbe.includedSerialAfter),
+        static_cast<unsigned long long>(g_mouseFrameProbe.selectedSerial),
         viewModelHandle, viewModelSourceOrigin[0], viewModelSourceOrigin[1],
         viewModelSourceOrigin[2], viewModelPresentedOrigin[0],
         viewModelPresentedOrigin[1], viewModelPresentedOrigin[2],
@@ -2681,7 +2971,8 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
                                         g_appliedEntityPoses);
     AppendInterpolationTrace(
         view, presentedView, cameraInterpolated, mouseOverlaid,
-        interpolationAlpha, latestTicAlpha, pendingTicAlpha, appliedCount,
+        interpolationAlpha, latestTicAlpha, pendingTicAlpha, basePitch,
+        appliedCount,
         g_appliedEntityPoses, beforeEntities);
     g_originalSingleView(self, hud, presentedView);
     RestoreRenderEntities(g_appliedEntityPoses, appliedCount);
@@ -2718,6 +3009,205 @@ bool WriteVtableSlot(void** slot, void* value) {
     VirtualProtect(slot, sizeof(*slot), oldProtection, &ignored);
     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(*slot));
     return *slot == value;
+}
+
+std::optional<int> RequestedCvarInteger(const char* name) {
+    if (name == nullptr) return std::nullopt;
+    if (_stricmp(name, "r_mode") == 0) return g_requestedMode;
+    if (_stricmp(name, "r_fullscreen") == 0) return g_requestedFullscreen;
+    if (_stricmp(name, "r_swapInterval") == 0) {
+        return g_requestedSwapInterval;
+    }
+    if (_stricmp(name, "r_customWidth") == 0) {
+        return g_requestedCustomWidth;
+    }
+    if (_stricmp(name, "r_customHeight") == 0) {
+        return g_requestedCustomHeight;
+    }
+    return std::nullopt;
+}
+
+void ApplyDisplayOverrides(void* cvarSystem) {
+    int validationState =
+        g_retailValidationState.load(std::memory_order_acquire);
+    if (validationState == 0 && g_retailValidationEvent != nullptr) {
+        WaitForSingleObject(g_retailValidationEvent, 30'000);
+        validationState =
+            g_retailValidationState.load(std::memory_order_acquire);
+    }
+    if (validationState != 1) return;
+
+    int expected = 0;
+    if (!g_displayOverrideStartupState.compare_exchange_strong(
+            expected, 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    const auto set = [cvarSystem](const char* name,
+                                  const std::optional<int>& value) {
+        if (value) g_originalSetCVarInteger(cvarSystem, name, *value, 0);
+    };
+    set("r_mode", g_requestedMode);
+    set("r_customWidth", g_requestedCustomWidth);
+    set("r_customHeight", g_requestedCustomHeight);
+    set("r_fullscreen", g_requestedFullscreen);
+    set("r_swapInterval", g_requestedSwapInterval);
+    g_displayOverrideStartupState.store(2, std::memory_order_release);
+    Log("display: renderer cvar overrides applied on the engine thread\r\n");
+}
+
+void __fastcall HookedSetCVarString(void* self, void*, const char* name,
+                                    const char* value, int flags) {
+    ApplyDisplayOverrides(self);
+    char replacement[24]{};
+    if (g_retailValidationState.load(std::memory_order_acquire) == 1 &&
+        g_displayOverrideStartupState.load(std::memory_order_acquire) != 3) {
+        if (const auto requested = RequestedCvarInteger(name)) {
+            _snprintf_s(replacement, sizeof(replacement), _TRUNCATE, "%d",
+                        *requested);
+            value = replacement;
+        }
+    }
+    g_originalSetCVarString(self, name, value, flags);
+}
+
+void __fastcall HookedSetCVarBool(void* self, void*, const char* name,
+                                  bool value, int flags) {
+    ApplyDisplayOverrides(self);
+    if (g_retailValidationState.load(std::memory_order_acquire) == 1 &&
+        g_displayOverrideStartupState.load(std::memory_order_acquire) != 3) {
+        if (const auto requested = RequestedCvarInteger(name)) {
+            value = *requested != 0;
+        }
+    }
+    g_originalSetCVarBool(self, name, value, flags);
+}
+
+void __fastcall HookedSetCVarInteger(void* self, void*, const char* name,
+                                     int value, int flags) {
+    ApplyDisplayOverrides(self);
+    if (g_retailValidationState.load(std::memory_order_acquire) == 1 &&
+        g_displayOverrideStartupState.load(std::memory_order_acquire) != 3) {
+        if (const auto requested = RequestedCvarInteger(name)) value = *requested;
+    }
+    g_originalSetCVarInteger(self, name, value, flags);
+}
+
+bool InstallDisplayCvarHooks(DWORD timeoutMilliseconds, std::string& error) {
+    if (!g_requestedMode && !g_requestedFullscreen &&
+        !g_requestedSwapInterval && !g_requestedCustomWidth &&
+        !g_requestedCustomHeight) {
+        return true;
+    }
+
+    auto* executable =
+        reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    if (executable == nullptr) {
+        error = "the main executable module is unavailable";
+        return false;
+    }
+    auto** vtable =
+        reinterpret_cast<void**>(executable + kCvarSystemVtableRva);
+    const ULONGLONG deadline = GetTickCount64() + timeoutMilliseconds;
+    while (!IsReadableRange(vtable, 9 * sizeof(void*)) ||
+           vtable[6] != executable + kSetCVarStringRva ||
+           vtable[7] != executable + kSetCVarBoolRva ||
+           vtable[8] != executable + kSetCVarIntegerRva) {
+        if (GetTickCount64() >= deadline) {
+            error = "the validated static idCVarSystem vtable did not appear before timeout";
+            return false;
+        }
+        Sleep(1);
+    }
+    g_setCVarStringSlot = &vtable[6];
+    g_setCVarBoolSlot = &vtable[7];
+    g_setCVarIntegerSlot = &vtable[8];
+    g_originalSetCVarString =
+        reinterpret_cast<SetCVarStringFn>(*g_setCVarStringSlot);
+    g_originalSetCVarBool =
+        reinterpret_cast<SetCVarBoolFn>(*g_setCVarBoolSlot);
+    g_originalSetCVarInteger =
+        reinterpret_cast<SetCVarIntegerFn>(*g_setCVarIntegerSlot);
+    if (g_originalSetCVarString == nullptr || g_originalSetCVarBool == nullptr ||
+        g_originalSetCVarInteger == nullptr) {
+        error = "the validated idCVarSystem vtable has null setter slots";
+        return false;
+    }
+    const bool stringInstalled = WriteVtableSlot(
+        g_setCVarStringSlot, reinterpret_cast<void*>(&HookedSetCVarString));
+    const bool boolInstalled = stringInstalled &&
+        WriteVtableSlot(g_setCVarBoolSlot,
+                        reinterpret_cast<void*>(&HookedSetCVarBool));
+    const bool integerInstalled = boolInstalled &&
+        WriteVtableSlot(g_setCVarIntegerSlot,
+                        reinterpret_cast<void*>(&HookedSetCVarInteger));
+    if (!integerInstalled) {
+        if (boolInstalled) {
+            WriteVtableSlot(g_setCVarBoolSlot,
+                            reinterpret_cast<void*>(g_originalSetCVarBool));
+        }
+        if (stringInstalled) {
+            WriteVtableSlot(g_setCVarStringSlot,
+                            reinterpret_cast<void*>(g_originalSetCVarString));
+        }
+        error = "one or more idCVarSystem vtable slots could not be patched";
+        return false;
+    }
+    g_displayCvarHooksInstalled = true;
+    Log("display: validated static idCVarSystem hooks installed\r\n");
+    return true;
+}
+
+bool WaitForDisplayOverrides(DWORD timeoutMilliseconds, std::string& error) {
+    if (!g_displayCvarHooksInstalled) return true;
+    const ULONGLONG deadline = GetTickCount64() + timeoutMilliseconds;
+    do {
+        const int state =
+            g_displayOverrideStartupState.load(std::memory_order_acquire);
+        if (state == 2) return true;
+        if (state == 3) {
+            error = "the first presentation occurred before renderer cvar overrides began; the ASI loader invoked PreyHFR too late";
+            return false;
+        }
+        Sleep(1);
+    } while (GetTickCount64() < deadline);
+    error = "the engine did not consume renderer cvars before timeout";
+    return false;
+}
+
+bool RestoreDisplayCvarHooks() {
+    if (!g_displayCvarHooksInstalled) return true;
+    const auto restore = [](void** slot, void* hook, void* original) {
+        if (slot == nullptr) return false;
+        if (*slot == original) return true;
+        return *slot == hook && WriteVtableSlot(slot, original);
+    };
+    const bool integerRestored = restore(
+        g_setCVarIntegerSlot, reinterpret_cast<void*>(&HookedSetCVarInteger),
+        reinterpret_cast<void*>(g_originalSetCVarInteger));
+    const bool boolRestored = restore(
+        g_setCVarBoolSlot, reinterpret_cast<void*>(&HookedSetCVarBool),
+        reinterpret_cast<void*>(g_originalSetCVarBool));
+    const bool stringRestored = restore(
+        g_setCVarStringSlot, reinterpret_cast<void*>(&HookedSetCVarString),
+        reinterpret_cast<void*>(g_originalSetCVarString));
+    return integerRestored && boolRestored && stringRestored;
+}
+
+void DisableConfiguredRendererCvarOverrides() {
+    // Borderless window styling is applied from SwapBuffers and does not
+    // depend on the renderer cvar hooks. Keep the requested dimensions as a
+    // safety check so a late-loaded ASI may still remove the window chrome
+    // when the game is already rendering at the desktop resolution.
+    if (!g_borderlessRequested) {
+        g_requestedRenderWidth = 0;
+        g_requestedRenderHeight = 0;
+    }
+    g_requestedMode.reset();
+    g_requestedFullscreen.reset();
+    g_requestedSwapInterval.reset();
+    g_requestedCustomWidth.reset();
+    g_requestedCustomHeight.reset();
 }
 
 bool IsRunGameTicCaller(const void* returnAddress) {
@@ -3661,6 +4151,13 @@ void ReportFrame() {
 }
 
 BOOL WINAPI HookedSwapBuffers(HDC deviceContext) {
+    int waitingForDisplayOverrides = 0;
+    g_displayOverrideStartupState.compare_exchange_strong(
+        waitingForDisplayOverrides, 3, std::memory_order_acq_rel,
+        std::memory_order_acquire);
+    if (!g_patchActive.load(std::memory_order_acquire)) {
+        return g_originalSwapBuffers(deviceContext);
+    }
     DWORD expectedThread = 0;
     g_presentationThreadId.compare_exchange_strong(
         expectedThread, GetCurrentThreadId(), std::memory_order_release,
@@ -3678,12 +4175,14 @@ BOOL WINAPI HookedSwapBuffers(HDC deviceContext) {
     return result;
 }
 
-bool Initialize() {
-    const std::wstring logPath = ReadEnvironment(L"PREYHFR_LOG");
-    if (!logPath.empty()) {
-        g_log = CreateFileW(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    }
+bool OpenLog(const fs::path& path) {
+    g_log = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    return g_log != INVALID_HANDLE_VALUE;
+}
+
+void ConfigureFromEnvironment() {
     QueryPerformanceFrequency(&g_frequency);
     g_viewLoggingRequested = ReadEnvironmentFlag(L"PREYHFR_VIEW_LOG");
     g_cameraInterpolationRequested =
@@ -3729,13 +4228,68 @@ bool Initialize() {
         ReadEnvironmentUnsigned(L"PREYHFR_RENDER_WIDTH", 16384);
     g_requestedRenderHeight =
         ReadEnvironmentUnsigned(L"PREYHFR_RENDER_HEIGHT", 16384);
+}
+
+void ConfigureFromConfig(const preyhfr::Config& config) {
+    QueryPerformanceFrequency(&g_frequency);
+    g_viewLoggingRequested = config.viewLog;
+    g_cameraInterpolationRequested = config.cameraInterpolation;
+    g_viewModelInterpolationRequested = config.viewModelInterpolation;
+    g_viewModelAnimationInterpolationRequested =
+        config.viewModelAnimationInterpolation && config.cameraInterpolation;
+    g_worldInterpolationRequested =
+        config.worldInterpolation && config.cameraInterpolation;
+    g_worldAnimationInterpolationRequested =
+        config.worldAnimationInterpolation && config.cameraInterpolation;
+    g_maximumWorldEntityStep = config.maximumWorldEntityDistance;
+    g_maximumWorldEntityAngleDegrees = config.maximumWorldEntityAngle;
+    g_mouseInterpolationRequested =
+        config.mouseInterpolation && config.cameraInterpolation;
+    g_continuousSnapshotTimingRequested = config.continuousSnapshotTiming;
+    g_multiTicEntityAlignmentRequested =
+        config.multiTicEntityAlignment && config.continuousSnapshotTiming;
+    g_overdueSnapshotFallbackRequested =
+        config.overdueSnapshotFallback && g_multiTicEntityAlignmentRequested;
+    g_interpolationTraceRequested =
+        config.interpolationTrace && config.cameraInterpolation;
+    if (g_interpolationTraceRequested) {
+        g_interpolationTraceBuffer.reserve(512 * 1024);
+    }
+    g_timelineResetVirtualKey = config.timelineResetVirtualKey;
+    g_borderlessRequested = config.borderless;
+    g_requestedRenderWidth = config.resolution ? config.resolution->width : 0;
+    g_requestedRenderHeight = config.resolution ? config.resolution->height : 0;
+    g_requestedMode.reset();
+    g_requestedFullscreen.reset();
+    g_requestedSwapInterval.reset();
+    g_requestedCustomWidth.reset();
+    g_requestedCustomHeight.reset();
+    g_displayOverrideStartupState.store(0, std::memory_order_release);
+    if (config.resolution) {
+        g_requestedMode = -1;
+        g_requestedCustomWidth = static_cast<int>(config.resolution->width);
+        g_requestedCustomHeight = static_cast<int>(config.resolution->height);
+    }
+    if (config.borderless ||
+        config.displayMode == preyhfr::DisplayMode::Windowed) {
+        g_requestedFullscreen = 0;
+    } else if (config.displayMode == preyhfr::DisplayMode::Exclusive) {
+        g_requestedFullscreen = 1;
+    }
+    if (config.vSync == preyhfr::VSyncMode::Off) {
+        g_requestedSwapInterval = 0;
+    } else if (config.vSync == preyhfr::VSyncMode::On) {
+        g_requestedSwapInterval = 1;
+    }
+}
+
+bool InstallConfiguredHooks(unsigned int cap) {
     if (g_borderlessRequested) {
         // Establish physical-pixel coordinates before the retail engine creates
         // its OpenGL window. This keeps custom renderer dimensions aligned with
         // the monitor rectangle on scaled Windows desktops.
         SetProcessDPIAware();
     }
-    const unsigned int cap = ReadFrameCap();
     if (cap > 0 && g_frequency.QuadPart > 0) {
         g_periodCounts = std::max<std::int64_t>(1, g_frequency.QuadPart / cap);
         g_timerResolutionRaised = timeBeginPeriod(1) == TIMERR_NOERROR;
@@ -3819,7 +4373,164 @@ bool Initialize() {
     return true;
 }
 
+bool InitializeFromEnvironment() {
+    const std::wstring logPath = ReadEnvironment(L"PREYHFR_LOG");
+    if (!logPath.empty()) OpenLog(logPath);
+    ConfigureFromEnvironment();
+    return InstallConfiguredHooks(ReadFrameCap());
+}
+
+void Shutdown();
+
+void LogBootstrapFailure(const char* stage, const std::string& detail) {
+    std::string message = "bootstrap: ";
+    message += stage;
+    message += " failed: ";
+    message += detail;
+    message += "\r\n";
+    Log(message);
+}
+
+DWORD WINAPI BootstrapAsi(LPVOID) {
+    HMODULE pinnedModule = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_PIN,
+                       reinterpret_cast<LPCWSTR>(g_pluginModule), &pinnedModule);
+
+    const auto pluginPath = preyhfr::ModulePath(g_pluginModule);
+    if (!pluginPath) {
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    const fs::path pluginDirectory = pluginPath->parent_path();
+    OpenLog(pluginDirectory / L"PreyHFR.log");
+    Log("bootstrap: PreyHFR " PREYHFR_VERSION " ASI discovered\r\n");
+
+    preyhfr::Config config;
+    std::string error;
+    const fs::path configPath = pluginDirectory / L"PreyHFR.ini";
+    if (!preyhfr::LoadConfig(configPath, config, error) ||
+        !preyhfr::ResolveDesktopConfig(config, error)) {
+        LogBootstrapFailure("configuration", error);
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    Log("bootstrap: configuration valid: " + preyhfr::DescribeConfig(config) +
+        "\r\n");
+    if (!config.patchEnabled) {
+        Log("bootstrap: patch disabled by configuration; no hooks or patches installed\r\n");
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 0;
+    }
+
+    const auto executablePath = preyhfr::ModulePath(nullptr);
+    if (!executablePath ||
+        _wcsicmp(executablePath->filename().c_str(), L"prey.exe") != 0) {
+        LogBootstrapFailure("host validation",
+                            "the host executable is not prey.exe");
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    const auto executableHash = preyhfr::Sha256File(*executablePath);
+    if (!executableHash || *executableHash != preyhfr::kSupportedExeSha256) {
+        LogBootstrapFailure(
+            "host validation",
+            "unsupported prey.exe SHA-256 " +
+                executableHash.value_or("unavailable"));
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    ConfigureFromConfig(config);
+    g_retailValidationState.store(0, std::memory_order_release);
+    g_retailValidationEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_retailValidationEvent == nullptr) {
+        LogBootstrapFailure("validation synchronization",
+                            "could not create the retail-validation event");
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+
+    bool displayHooksAvailable = InstallDisplayCvarHooks(30'000, error);
+    if (!displayHooksAvailable) {
+        Log("warning: display cvar overrides unavailable: " + error +
+            "; continuing with game-configured display settings\r\n");
+        DisableConfiguredRendererCvarOverrides();
+    }
+    if (!InstallConfiguredHooks(config.framesPerSecond)) {
+        g_retailValidationState.store(2, std::memory_order_release);
+        SetEvent(g_retailValidationEvent);
+        LogBootstrapFailure("early hook installation",
+                            "required main-module import hook was unavailable");
+        Shutdown();
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    Log("bootstrap: early hooks installed in inactive state\r\n");
+
+    // A hooked engine cvar write waits on this validation while the bootstrap
+    // hashes the game module. This prevents renderer startup from outrunning
+    // validation without applying settings to an unsupported game DLL.
+    const fs::path gameDllPath =
+        executablePath->parent_path() / L"base" / L"gamex86.dll";
+    const auto gameDllHash = preyhfr::Sha256File(gameDllPath);
+    if (!gameDllHash || *gameDllHash != preyhfr::kSupportedGameDllSha256) {
+        g_retailValidationState.store(2, std::memory_order_release);
+        SetEvent(g_retailValidationEvent);
+        LogBootstrapFailure(
+            "game-module validation",
+            "unsupported base/gamex86.dll SHA-256 " +
+                gameDllHash.value_or("unavailable"));
+        Shutdown();
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    g_retailValidationState.store(1, std::memory_order_release);
+    SetEvent(g_retailValidationEvent);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    Log("bootstrap: supported retail executable and game DLL validated\r\n");
+
+    if (displayHooksAvailable && !WaitForDisplayOverrides(30'000, error)) {
+        const bool restored = RestoreDisplayCvarHooks();
+        Log("warning: display cvar override timing unavailable: " + error +
+            (restored ? "; cvar hooks restored" :
+                        "; one or more cvar hooks could not be restored") +
+            (g_borderlessRequested
+                 ? "; continuing with game-configured renderer settings and runtime borderless styling\r\n"
+                 : "; continuing with game-configured display settings\r\n"));
+        DisableConfiguredRendererCvarOverrides();
+    }
+
+    preyhfr::WaitGateResult waitGate;
+    if (!g_waitGatePatch.WaitAndApply(30'000, waitGate, error)) {
+        LogBootstrapFailure("render-wait patch", error);
+        Shutdown();
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    g_comTicNumberAddress = waitGate.comTicAddress;
+    char waitGateMessage[320]{};
+    const int waitGateLength = _snprintf_s(
+        waitGateMessage, sizeof(waitGateMessage), _TRUNCATE,
+        "bootstrap: timing gate %s at VA 0x%08llx; com_ticNumber=0x%08llx; "
+        "com_fixedTic=0x%08llx\r\n",
+        waitGate.alreadyPatched ? "was already patched" : "patched",
+        static_cast<unsigned long long>(waitGate.address),
+        static_cast<unsigned long long>(waitGate.comTicAddress),
+        static_cast<unsigned long long>(waitGate.fixedTicObjectPointerAddress));
+    if (waitGateLength > 0) {
+        Log(std::string(waitGateMessage,
+                        static_cast<std::size_t>(waitGateLength)));
+    }
+
+    g_patchActive.store(true, std::memory_order_release);
+    Log("bootstrap: ASI activation complete\r\n");
+    g_initializationComplete.store(true, std::memory_order_release);
+    return 0;
+}
+
 void Shutdown() {
+    g_patchActive.store(false, std::memory_order_release);
+    const bool waitGateWasOwned = g_waitGatePatch.ownsPatch();
     if (!g_interpolationTraceBuffer.empty()) {
         Log(g_interpolationTraceBuffer);
         g_interpolationTraceBuffer.clear();
@@ -3829,6 +4540,10 @@ void Shutdown() {
         if (*slot == original) return true;
         return *slot == hook && WriteVtableSlot(slot, original);
     };
+    bool displayCvarHooksRestored = false;
+    if (g_displayCvarHooksInstalled) {
+        displayCvarHooksRestored = RestoreDisplayCvarHooks();
+    }
     bool renderEntityHooksRestored = false;
     if (g_renderEntityHookState == 1) {
         const bool freeRestored = restoreSlot(
@@ -4045,8 +4760,14 @@ void Shutdown() {
     }
     const bool borderlessRestored =
         !g_borderlessRequested || RestoreBorderlessWindow();
+    const bool waitGateRestored = g_waitGatePatch.Restore();
     if (g_timerResolutionRaised) timeEndPeriod(1);
     if (g_log != INVALID_HANDLE_VALUE) {
+        if (g_displayCvarHooksInstalled) {
+            Log(displayCvarHooksRestored
+                    ? "display: idCVarSystem override hooks restored\r\n"
+                    : "warning: display cvar hooks were not restored\r\n");
+        }
         if (g_viewModelInterpolationRequested || g_worldInterpolationRequested ||
             g_viewModelAnimationInterpolationRequested ||
             g_worldAnimationInterpolationRequested) {
@@ -4110,6 +4831,11 @@ void Shutdown() {
         }
         Log(importRestored ? "hook: GDI32!SwapBuffers import restored\r\n"
                            : "warning: GDI32!SwapBuffers import was not restored\r\n");
+        if (waitGateWasOwned) {
+            Log(waitGateRestored
+                    ? "patch: render-wait gate restored\r\n"
+                    : "warning: render-wait gate was not restored\r\n");
+        }
         Log("hook: process shutdown\r\n");
         FlushFileBuffers(g_log);
         CloseHandle(g_log);
@@ -4166,6 +4892,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                        kMaximumInterpolatedCameraIntervalMilliseconds,
                        0, 0, frequency, false),
                    0.5) ||
+             !close(CameraRotationInterpolationAlpha(0.75), 0.75) ||
+             !close(CameraRotationInterpolationAlpha(1.75), 1.0) ||
             CameraSnapshotClockDebtExceeded(
                 0, kNativeTicMilliseconds,
                 kMaximumInterpolatedCameraIntervalMilliseconds,
@@ -4205,7 +4933,15 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                close(EntityInterpolationAlpha(
                          true, 1, cameraAlpha, latestAlpha, pendingAlpha,
                          true, true),
-                     pendingAlpha);
+                     pendingAlpha) &&
+               close(AnimationInterpolationAlpha(
+                         false, 1, 1.75, latestAlpha, pendingAlpha,
+                         true, true),
+                     1.75) &&
+               close(AnimationInterpolationAlpha(
+                         false, 2, cameraAlpha, 1.5, pendingAlpha,
+                         true, true),
+                     1.5);
     };
     const auto testRate = [](double rate, bool requireGap,
                              bool requireAdjacentChanges) {
@@ -4218,6 +4954,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         std::int32_t currentTime = 0;
         std::int32_t currentInterval = kNativeTicMilliseconds;
         std::int64_t currentQpc = 0;
+        std::int64_t lastCallQpc = 0;
+        bool phaseRecoveryActive = false;
+        std::int64_t phaseRecoveryCandidateQpc = 0;
         std::int32_t entityPreviousTime = 0;
         std::int32_t entityCurrentTime = 0;
         std::uint32_t entityTransitionSamples = 0;
@@ -4262,14 +5001,19 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                     ++entityTransitionSamples;
                 }
                 if (synchronized) {
-                    currentQpc = (std::min)(
-                        currentQpc + CameraIntervalQpc(delta, frequency), now);
+                    currentQpc = UpdateCameraSnapshotClock(
+                        currentQpc, delta, lastCallQpc, now, frequency,
+                        phaseRecoveryActive,
+                        phaseRecoveryCandidateQpc).qpc;
                 } else {
                     currentQpc = now;
                     synchronized = true;
+                    phaseRecoveryActive = false;
+                    phaseRecoveryCandidateQpc = 0;
                 }
             }
             changedOnPreviousFrame = changed;
+            lastCallQpc = now;
             if (!synchronized) continue;
 
             const double alpha = CameraInterpolationAlpha(
@@ -4286,8 +5030,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                 static_cast<double>(entityCurrentTime - entityPreviousTime) *
                     entityAlpha;
             if (std::abs(entityPresented - presented) > 0.002) return false;
-            // Allow the phase estimator one 400 ms beat period to encounter
-            // an exact 60/120-to-62.5 Hz boundary and finish locking on.
+            // Allow the first snapshot transition to establish the stable
+            // presentation phase before checking its increments.
             if (havePresented && frame >= 64) {
                 const double expected = 1000.0 / rate;
                 if (std::abs((presented - previousPresented) - expected) >
@@ -4317,6 +5061,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         std::int32_t entityPreviousTime = 0;
         std::int32_t entityCurrentTime = 0;
         std::int64_t currentQpc = 0;
+        std::int64_t lastCallQpc = 0;
+        bool phaseRecoveryActive = false;
+        std::int64_t phaseRecoveryCandidateQpc = 0;
         double previousPresented = 0.0;
 
         for (std::int64_t frame = 0; frame < 1800; ++frame) {
@@ -4353,13 +5100,18 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                 currentTime = viewTime;
                 currentInterval = delta;
                 if (synchronized) {
-                    currentQpc = (std::min)(
-                        currentQpc + CameraIntervalQpc(delta, frequency), now);
+                    currentQpc = UpdateCameraSnapshotClock(
+                        currentQpc, delta, lastCallQpc, now, frequency,
+                        phaseRecoveryActive,
+                        phaseRecoveryCandidateQpc).qpc;
                 } else {
                     currentQpc = now;
                     synchronized = true;
+                    phaseRecoveryActive = false;
+                    phaseRecoveryCandidateQpc = 0;
                 }
             }
+            lastCallQpc = now;
             if (!synchronized) continue;
 
             const double cameraAlpha = CameraInterpolationAlpha(
@@ -4399,10 +5151,126 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         return sawGap && sawPending;
     };
 
-    return testFeatureGates() && testRate(120.0, false, true) &&
-            testRate(60.0, true, false) && testOverdue360()
-        ? TRUE
-        : FALSE;
+    const auto testBatchedPhaseExcursion = [] {
+        // The retail trace regularly accumulates about one tick of apparent
+        // lag across 16 ms samples, then cancels it with a 32 ms camera bridge.
+        // That short batching cycle must never start phase recovery.
+        struct Sample {
+            std::int32_t intervalMilliseconds;
+            double observedMidpointMilliseconds;
+        };
+        constexpr std::array<Sample, 3> samples{{
+            {16, 30.6868},
+            {16, 46.4000},
+            {32, 65.0000},
+        }};
+        constexpr double halfCallGapMilliseconds = 1.5999;
+        std::int64_t currentSnapshotQpc = 0;
+        bool phaseRecoveryActive = false;
+        std::int64_t phaseRecoveryCandidateQpc = 0;
+        bool sawCandidate = false;
+        for (const Sample& sample : samples) {
+            const std::int64_t midpointQpc = static_cast<std::int64_t>(
+                std::llround(sample.observedMidpointMilliseconds *
+                             static_cast<double>(frequency) / 1000.0));
+            const std::int64_t halfGapQpc = static_cast<std::int64_t>(
+                std::llround(halfCallGapMilliseconds *
+                             static_cast<double>(frequency) / 1000.0));
+            const CameraSnapshotClockUpdate update =
+                UpdateCameraSnapshotClock(
+                    currentSnapshotQpc, sample.intervalMilliseconds,
+                    midpointQpc - halfGapQpc, midpointQpc + halfGapQpc,
+                    frequency, phaseRecoveryActive,
+                    phaseRecoveryCandidateQpc);
+            currentSnapshotQpc = update.qpc;
+            sawCandidate = sawCandidate || phaseRecoveryCandidateQpc != 0;
+            if (update.recoveryStarted || update.correctionQpc != 0 ||
+                phaseRecoveryActive) {
+                return false;
+            }
+        }
+        return sawCandidate && phaseRecoveryCandidateQpc == 0;
+    };
+
+    const auto testSustainedPhaseRecovery = [] {
+        // Reproduce the captured rollback geometry, then keep the observed
+        // phase persistently late. Debounce must preserve the first frames,
+        // bounded recovery must eventually start, and every presented time
+        // must remain forward-moving until synchronization is restored.
+        constexpr double callGapMilliseconds = 3.1998;
+        constexpr double firstMidpointMilliseconds = 30.6868;
+        const std::int64_t callGapQpc = static_cast<std::int64_t>(
+            std::llround(callGapMilliseconds *
+                         static_cast<double>(frequency) / 1000.0));
+        const std::int64_t halfGapQpc = callGapQpc / 2;
+        const std::int64_t nativeTicQpc = CameraIntervalQpc(
+            kNativeTicMilliseconds, frequency);
+        std::int64_t midpointQpc = static_cast<std::int64_t>(
+            std::llround(firstMidpointMilliseconds *
+                         static_cast<double>(frequency) / 1000.0));
+        std::int64_t currentSnapshotQpc = 0;
+        bool phaseRecoveryActive = false;
+        std::int64_t phaseRecoveryCandidateQpc = 0;
+        double previousViewTime = kNativeTicMilliseconds;
+        const double previousPresented = 29.0869;
+        double lastPresented = previousPresented;
+        bool sawCandidate = false;
+        bool sawRecoveryStart = false;
+        bool sawRecoveryFinish = false;
+        for (int sample = 0; sample < 64; ++sample) {
+            const std::int64_t nowQpc = midpointQpc + halfGapQpc;
+            const CameraSnapshotClockUpdate update =
+                UpdateCameraSnapshotClock(
+                    currentSnapshotQpc, kNativeTicMilliseconds,
+                    midpointQpc - halfGapQpc, nowQpc, frequency,
+                    phaseRecoveryActive, phaseRecoveryCandidateQpc);
+            currentSnapshotQpc = update.qpc;
+            sawCandidate = sawCandidate || phaseRecoveryCandidateQpc != 0;
+            sawRecoveryStart = sawRecoveryStart || update.recoveryStarted;
+            const double alpha = CameraInterpolationAlphaForMode(
+                kNativeTicMilliseconds, nowQpc, currentSnapshotQpc,
+                frequency, true);
+            const double presented = previousViewTime +
+                static_cast<double>(kNativeTicMilliseconds) * alpha;
+            if (presented <= lastPresented) return false;
+            if (!sawRecoveryStart && update.correctionQpc != 0) return false;
+            lastPresented = presented;
+            if (update.recoveryFinished) {
+                sawRecoveryFinish = true;
+                break;
+            }
+            midpointQpc += nativeTicQpc;
+            previousViewTime += kNativeTicMilliseconds;
+        }
+
+        const double rebasedPresented =
+            static_cast<double>(kNativeTicMilliseconds);
+        return sawCandidate && sawRecoveryStart && sawRecoveryFinish &&
+               !phaseRecoveryActive && phaseRecoveryCandidateQpc == 0 &&
+               rebasedPresented < previousPresented;
+    };
+
+    const bool featureGatesPassed = testFeatureGates();
+    const bool rate120Passed = testRate(120.0, false, true);
+    const bool rate60Passed = testRate(60.0, true, false);
+    const bool overdue360Passed = testOverdue360();
+    const bool batchedPhasePassed = testBatchedPhaseExcursion();
+    const bool sustainedPhasePassed = testSustainedPhaseRecovery();
+    if (!featureGatesPassed || !rate120Passed || !rate60Passed ||
+        !overdue360Passed || !batchedPhasePassed ||
+        !sustainedPhasePassed) {
+        char line[288]{};
+        const int length = _snprintf_s(
+            line, sizeof(line), _TRUNCATE,
+            "test: interpolation cadence failed; features=%d rate120=%d "
+            "rate60=%d overdue360=%d batched_phase=%d sustained_phase=%d\r\n",
+            featureGatesPassed ? 1 : 0, rate120Passed ? 1 : 0,
+            rate60Passed ? 1 : 0, overdue360Passed ? 1 : 0,
+            batchedPhasePassed ? 1 : 0, sustainedPhasePassed ? 1 : 0);
+        if (length > 0) Log(std::string(line, static_cast<std::size_t>(length)));
+        return FALSE;
+    }
+    return TRUE;
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestBorderless(HDC deviceContext) {
@@ -4412,11 +5280,36 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestBorderless(HDC deviceCon
            g_borderlessWindow.applied ? TRUE : FALSE;
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
+extern "C" __declspec(dllexport) DWORD WINAPI PreyHFRGetInitializationState() {
+    if (!g_initializationComplete.load(std::memory_order_acquire)) return 0;
+    return g_patchActive.load(std::memory_order_acquire) ? 1 : 2;
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
-        return Initialize() ? TRUE : FALSE;
+        g_pluginModule = instance;
+        wchar_t probeMode[2]{};
+        g_probeMode = GetEnvironmentVariableW(
+                          L"PREYHFR_PROBE", probeMode,
+                          static_cast<DWORD>(std::size(probeMode))) != 0 &&
+                      probeMode[0] == L'1';
+        if (g_probeMode) {
+            const bool initialized = InitializeFromEnvironment();
+            g_patchActive.store(initialized, std::memory_order_release);
+            g_initializationComplete.store(true, std::memory_order_release);
+            return initialized ? TRUE : FALSE;
+        }
+        const HANDLE bootstrap =
+            CreateThread(nullptr, 0, &BootstrapAsi, nullptr, 0, nullptr);
+        if (bootstrap == nullptr) return FALSE;
+        SetThreadPriority(bootstrap, THREAD_PRIORITY_HIGHEST);
+        CloseHandle(bootstrap);
+        return TRUE;
     }
-    if (reason == DLL_PROCESS_DETACH) Shutdown();
+    if (reason == DLL_PROCESS_DETACH) {
+        g_patchActive.store(false, std::memory_order_release);
+        if (g_probeMode && reserved == nullptr) Shutdown();
+    }
     return TRUE;
 }
