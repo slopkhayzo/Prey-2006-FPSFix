@@ -1,4 +1,4 @@
-PreyHFR 1.0.5
+PreyHFR 1.0.6
 ===============
 
 PreyHFR is an unofficial 32-bit ASI high-frame-rate fix for the Windows Steam
@@ -8,18 +8,20 @@ rates while keeping gameplay at its original speed.
 No original game files are replaced or modified.
 
 
-WHAT'S NEW IN 1.0.5
+WHAT'S NEW IN 1.0.6
 -------------------
 
-- Advances renderer-only particle and material time on every presented frame,
-  eliminating the 16 ms hold-and-jump strobe visible in continuous fire and
-  similar effects at high presentation rates.
-- Keeps gameplay FX spawning, scripts, sound, and simulation on the original
-  62.5 Hz clock.
-- Logs the active WGL swap interval when supported. Variable-refresh engagement
-  remains driver-controlled and should be confirmed with the driver's overlay.
-- Retains the async-timer cadence stabilization and lower-latency interpolation
-  architecture introduced in 1.0.4.
+- Replaces whole-file game SHA-256 activation gates with fail-closed structural
+  compatibility validation scoped to the enabled features.
+- Accepts a different file identity only when the expected x86 PE layout,
+  retail imports/exports, hook ABIs, deprotected engine timing/control flow,
+  and referenced data relationships all validate.
+- Expands the timing-path signature and verifies the RunGameTic user-command
+  call/return relationship before mouse interpolation activates.
+- Treats required scheduler-clock and DirectInput hooks as transactional:
+  partial installation is rolled back and the plugin remains inert.
+- Retains the 1.0.5 renderer effects clock and all prior interpolation,
+  async-clock, display, input, and rollback behavior.
 
 
 QUICK INSTALL - BUNDLE WITH LOADER
@@ -119,7 +121,7 @@ now that PreyHFR stabilizes the game's asynchronous tic clock directly.
 SUPPORTED GAME VERSION
 ----------------------
 
-The ASI supports the tested Windows Steam 1.4 files with these SHA-256 hashes:
+The fully tested Windows Steam 1.4 baseline has these SHA-256 hashes:
 
 prey.exe:
 CEA6D424FBB8E2FFBF307A5BEE509B45C2D35242F70BE31387224DB2A0EADD69
@@ -127,8 +129,18 @@ CEA6D424FBB8E2FFBF307A5BEE509B45C2D35242F70BE31387224DB2A0EADD69
 base\gamex86.dll:
 74D436D376BA144762A28C940D0243135B4F9DB8FDD7EE597B9CB5E4277B43C6
 
-The plugin stays inert if the files do not match. Other releases are not
-currently supported.
+These hashes identify the validation baseline; they are not an activation
+allowlist. The plugin instead requires the expected x86 PE32 layout, retail
+imports and GetGameAPI export, configured hook locations/prologues, one unique
+deprotected engine timing path, and its verified references to writable engine
+globals. Runtime object/vtable hooks validate their expected relationships when
+the objects appear. A different file identity is accepted only when all paths
+needed by the enabled features remain structurally compatible. Missing or
+ambiguous prerequisites leave the plugin inert and roll back owned changes.
+
+Layout-compatible variants have not automatically completed the full gameplay
+test matrix merely by passing this safety/ABI gate. Layout-changing releases
+remain unsupported.
 
 
 KNOWN LIMITS

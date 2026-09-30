@@ -35,14 +35,16 @@ string(JSON _format GET "${_manifest}" manifest_format)
 string(JSON _name GET "${_manifest}" name)
 string(JSON _version GET "${_manifest}" version)
 string(JSON _target GET "${_manifest}" target)
-string(JSON _exe_hash GET "${_manifest}" supported_retail_build prey.exe_sha256)
-string(JSON _dll_hash GET "${_manifest}" supported_retail_build "base/gamex86.dll_sha256")
+string(JSON _compatibility_policy GET "${_manifest}" compatibility policy)
+string(JSON _exe_hash GET "${_manifest}" compatibility tested_baseline_prey.exe_sha256)
+string(JSON _dll_hash GET "${_manifest}" compatibility tested_baseline_gamex86.dll_sha256)
 
-if(NOT _format EQUAL 1 OR NOT _name STREQUAL "PreyHFR" OR
+if(NOT _format EQUAL 2 OR NOT _name STREQUAL "PreyHFR" OR
    NOT _version STREQUAL EXPECTED_VERSION OR NOT _target STREQUAL "windows-x86")
     message(FATAL_ERROR "Release manifest identity is invalid")
 endif()
-if(NOT _exe_hash STREQUAL
+if(NOT _compatibility_policy STREQUAL "prey-1.4-x86-structural-v1" OR
+   NOT _exe_hash STREQUAL
        "cea6d424fbb8e2ffbf307a5bee509b45c2d35242f70be31387224db2a0eadd69" OR
    NOT _dll_hash STREQUAL
        "74d436d376ba144762a28c940d0243135b4f9db8fdd7ee597b9cb5e4277b43c6")
@@ -100,4 +102,4 @@ require_x86_pe("PreyHFR.asi")
 
 message(STATUS
     "Verified PreyHFR ${EXPECTED_VERSION}: exact payload, SHA-256 manifest, "
-    "x86 ASI image, and supported retail-build identity")
+    "x86 ASI image, and structural compatibility policy")

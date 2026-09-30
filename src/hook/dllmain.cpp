@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 
+#include "compatibility.h"
 #include "config.h"
 #include "integrity.h"
 #include "preyhfr_version.h"
@@ -58,29 +59,36 @@ using TimeBeginPeriodFn = MMRESULT(WINAPI*)(UINT);
 using TimeGetTimeFn = DWORD(WINAPI*)();
 using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
 
-constexpr std::uintptr_t kSingleViewRva = 0x001a8de0;
-constexpr std::uintptr_t kCalculateRenderViewRva = 0x00087600;
-constexpr std::uintptr_t kDetermineViewAnglesRva = 0x00195730;
-constexpr std::uintptr_t kGameRenderWorldPointerRva = 0x0038ff60;
-constexpr std::uintptr_t kMouseMoveRva = 0x00069000;
-constexpr std::uintptr_t kUsercmdTicCmdRva = 0x00068ba0;
-constexpr std::uintptr_t kUsercmdInterruptRva = 0x00069880;
-constexpr std::uintptr_t kGetDirectUsercmdRva = 0x00069970;
-constexpr std::uintptr_t kCvarSystemVtableRva = 0x003af26c;
-constexpr std::uintptr_t kSetCVarStringRva = 0x0002db00;
-constexpr std::uintptr_t kSetCVarBoolRva = 0x0002db10;
-constexpr std::uintptr_t kSetCVarIntegerRva = 0x0002db90;
-constexpr std::uintptr_t kRunGameTicRvaBegin = 0x0005c670;
-constexpr std::uintptr_t kRunGameTicRvaEnd = 0x0005cf00;
-constexpr std::uintptr_t kSensitivityCvarPointerRva = 0x0044298c;
-constexpr std::uintptr_t kPitchCvarPointerRva = 0x004429c0;
-constexpr std::uintptr_t kYawCvarPointerRva = 0x004429f4;
-constexpr std::uintptr_t kSmoothCvarPointerRva = 0x00442a5c;
-constexpr std::uintptr_t kClearEntityDefDynamicModelRva = 0x000df3e0;
-constexpr std::size_t kSingleViewStolenBytes = 6;
-constexpr std::size_t kCalculateRenderViewStolenBytes = 6;
-constexpr std::size_t kDetermineViewAnglesStolenBytes = 6;
-constexpr std::size_t kMouseMoveStolenBytes = 9;
+using preyhfr::kCalculateRenderViewPrologue;
+using preyhfr::kCalculateRenderViewRva;
+using preyhfr::kClearEntityDefDynamicModelPrologue;
+using preyhfr::kClearEntityDefDynamicModelRva;
+using preyhfr::kCvarSystemVtableRva;
+using preyhfr::kDetermineViewAnglesPrologue;
+using preyhfr::kDetermineViewAnglesRva;
+using preyhfr::kGameRenderWorldPointerRva;
+using preyhfr::kGetDirectUsercmdRva;
+using preyhfr::kMouseMoveRva;
+using preyhfr::kPitchCvarPointerRva;
+using preyhfr::kRunGameTicRvaBegin;
+using preyhfr::kRunGameTicRvaEnd;
+using preyhfr::kSensitivityCvarPointerRva;
+using preyhfr::kSetCVarBoolRva;
+using preyhfr::kSetCVarIntegerRva;
+using preyhfr::kSetCVarStringRva;
+using preyhfr::kSingleViewPrologue;
+using preyhfr::kSingleViewRva;
+using preyhfr::kSmoothCvarPointerRva;
+using preyhfr::kUsercmdInterruptRva;
+using preyhfr::kUsercmdTicCmdRva;
+using preyhfr::kYawCvarPointerRva;
+constexpr std::size_t kSingleViewStolenBytes = kSingleViewPrologue.size();
+constexpr std::size_t kCalculateRenderViewStolenBytes =
+    kCalculateRenderViewPrologue.size();
+constexpr std::size_t kDetermineViewAnglesStolenBytes =
+    kDetermineViewAnglesPrologue.size();
+constexpr std::size_t kMouseMoveStolenBytes =
+    preyhfr::kMouseMoveInstructionSize;
 constexpr std::size_t kRenderViewSize = 140;
 constexpr std::size_t kRenderViewTimeOffset = 80;
 constexpr std::size_t kRenderEntityAllowViewIdOffset = 56;
@@ -128,29 +136,6 @@ constexpr std::size_t kTrackedUsercmdCount = 128;
 constexpr std::size_t kProducedCameraSnapshotQueueSize = 8;
 constexpr std::size_t kProducedEntitySnapshotQueueSize = 4;
 constexpr std::size_t kAsyncTimerTraceCapacity = 4096;
-constexpr std::array<std::uint8_t, kSingleViewStolenBytes> kSingleViewPrologue{
-    0x64, 0xa1, 0x00, 0x00, 0x00, 0x00 // mov eax, fs:[0]
-};
-constexpr std::array<std::uint8_t, kCalculateRenderViewStolenBytes>
-    kCalculateRenderViewPrologue{
-        0x83, 0xec, 0x10, // sub esp, 10h
-        0x56,             // push esi
-        0x8b, 0xf1        // mov esi, ecx
-    };
-constexpr std::array<std::uint8_t, kDetermineViewAnglesStolenBytes>
-    kDetermineViewAnglesPrologue{
-        0x55,                         // push ebp
-        0x8b, 0xec,                   // mov ebp, esp
-        0x83, 0xe4, 0xc0              // and esp, -40h
-    };
-constexpr std::array<std::uint8_t, kMouseMoveStolenBytes> kMouseMovePrologue{
-    0x83, 0xec, 0x1c,                   // sub esp, 1ch
-    0x8b, 0x15, 0xf0, 0xa0, 0x19, 0x01 // mov edx, [0119a0f0h]
-};
-constexpr std::array<std::uint8_t, 16> kClearEntityDefDynamicModelPrologue{
-    0x56, 0x57, 0x8b, 0x7c, 0x24, 0x0c, 0x8b, 0xb7,
-    0x78, 0x01, 0x00, 0x00, 0x85, 0xf6, 0x74, 0x13
-};
 constexpr GUID kSystemMouseGuid{
     0x6f1d2b60, 0xd5a0, 0x11cf,
     {0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
@@ -1143,6 +1128,185 @@ bool IsReadableRange(const void* address, std::size_t size) {
     const auto regionStart = reinterpret_cast<std::uintptr_t>(information.BaseAddress);
     return start >= regionStart && start + size >= start &&
            start + size <= regionStart + information.RegionSize;
+}
+
+const IMAGE_SECTION_HEADER* ModuleSectionFor(const std::uint8_t* module,
+                                             const void* address,
+                                             std::size_t size) {
+    if (module == nullptr || address == nullptr || size == 0) return nullptr;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    if (!IsReadableRange(dos, sizeof(*dos)) ||
+        dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+        return nullptr;
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
+        module + dos->e_lfanew);
+    if (!IsReadableRange(nt, sizeof(*nt)) ||
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        return nullptr;
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    const auto imageBegin = reinterpret_cast<std::uintptr_t>(module);
+    const auto end = begin + size;
+    const auto imageEnd = imageBegin + nt->OptionalHeader.SizeOfImage;
+    if (begin < imageBegin || end < begin || end > imageEnd) return nullptr;
+    const auto rva = begin - imageBegin;
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    if (!IsReadableRange(sections, static_cast<std::size_t>(
+            nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER))) {
+        return nullptr;
+    }
+    for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
+        const auto& section = sections[index];
+        const std::uint64_t sectionBegin = section.VirtualAddress;
+        const std::uint64_t sectionEnd = sectionBegin +
+            (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+        if (rva >= sectionBegin && rva + size <= sectionEnd) {
+            return &section;
+        }
+    }
+    return nullptr;
+}
+
+bool ModuleRangeHasCharacteristics(const std::uint8_t* module,
+                                   const void* address, std::size_t size,
+                                   DWORD required) {
+    const auto* section = ModuleSectionFor(module, address, size);
+    return section != nullptr &&
+        (section->Characteristics & required) == required;
+}
+
+bool ValidateMouseMoveEntry(const std::uint8_t* module, std::string& error) {
+    const auto* target = module + kMouseMoveRva;
+    if (!ModuleRangeHasCharacteristics(
+            module, target, kMouseMoveStolenBytes,
+            IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ) ||
+        std::memcmp(target, preyhfr::kMouseMoveOpcodePrefix.data(),
+                    preyhfr::kMouseMoveOpcodePrefix.size()) != 0) {
+        error = "idUsercmdGenLocal::MouseMove entry shape is incompatible";
+        return false;
+    }
+    std::uint32_t referencedAddress = 0;
+    std::memcpy(&referencedAddress,
+                target + preyhfr::kMouseMoveOpcodePrefix.size(),
+                sizeof(referencedAddress));
+    const auto* referenced = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(referencedAddress));
+    if (!ModuleRangeHasCharacteristics(
+            module, referenced, sizeof(std::uint32_t),
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)) {
+        error = "MouseMove entry does not reference writable engine data";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateRunGameTicUsercmdPath(const std::uint8_t* module,
+                                   std::string& error) {
+    const auto* target = module + preyhfr::kRunGameTicUsercmdSelectionRva;
+    if (!ModuleRangeHasCharacteristics(
+            module, target, preyhfr::kRunGameTicUsercmdPattern.size(),
+            IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)) {
+        error = "RunGameTic user-command selection is not executable code";
+        return false;
+    }
+    for (std::size_t index = 0;
+         index < preyhfr::kRunGameTicUsercmdPattern.size(); ++index) {
+        if (preyhfr::kRunGameTicUsercmdMask[index] &&
+            target[index] != preyhfr::kRunGameTicUsercmdPattern[index]) {
+            error = "RunGameTic user-command call relationship is incompatible";
+            return false;
+        }
+    }
+    std::uint32_t fixedTicPointerAddress = 0;
+    std::uint32_t usercmdGeneratorPointerAddress = 0;
+    std::memcpy(&fixedTicPointerAddress, target + 2,
+                sizeof(fixedTicPointerAddress));
+    std::memcpy(&usercmdGeneratorPointerAddress, target + 12,
+                sizeof(usercmdGeneratorPointerAddress));
+    if ((fixedTicPointerAddress & (alignof(std::uint32_t) - 1)) != 0 ||
+        (usercmdGeneratorPointerAddress &
+         (alignof(std::uint32_t) - 1)) != 0 ||
+        !ModuleRangeHasCharacteristics(
+            module,
+            reinterpret_cast<const void*>(
+                static_cast<std::uintptr_t>(fixedTicPointerAddress)),
+            sizeof(std::uint32_t),
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE) ||
+        !ModuleRangeHasCharacteristics(
+            module,
+            reinterpret_cast<const void*>(
+                static_cast<std::uintptr_t>(usercmdGeneratorPointerAddress)),
+            sizeof(std::uint32_t),
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)) {
+        error = "RunGameTic user-command path references incompatible engine data";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateDeprotectedRuntime(
+    const preyhfr::CompatibilityRequirements& requirements,
+    const preyhfr::WaitGateResult& waitGate, std::string& error) {
+    auto* module = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    if (module == nullptr) {
+        error = "the main executable module is unavailable";
+        return false;
+    }
+    constexpr DWORD executableCode =
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    constexpr DWORD writableData = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    if (!ModuleRangeHasCharacteristics(
+            module, reinterpret_cast<const void*>(waitGate.address), 12,
+            executableCode)) {
+        error = "the timing gate is not in executable engine code";
+        return false;
+    }
+    if ((waitGate.comTicAddress & (alignof(std::uint32_t) - 1)) != 0 ||
+        (waitGate.fixedTicObjectPointerAddress &
+         (alignof(std::uint32_t) - 1)) != 0 ||
+        (waitGate.eventLoopObjectPointerAddress &
+         (alignof(std::uint32_t) - 1)) != 0 ||
+        !ModuleRangeHasCharacteristics(
+            module, reinterpret_cast<const void*>(waitGate.comTicAddress),
+            sizeof(std::uint32_t), writableData) ||
+        !ModuleRangeHasCharacteristics(
+            module,
+            reinterpret_cast<const void*>(
+                waitGate.fixedTicObjectPointerAddress),
+            sizeof(std::uint32_t), writableData) ||
+        !ModuleRangeHasCharacteristics(
+            module,
+            reinterpret_cast<const void*>(
+                waitGate.eventLoopObjectPointerAddress),
+            sizeof(std::uint32_t), writableData) ||
+        !ModuleRangeHasCharacteristics(
+            module,
+            reinterpret_cast<const void*>(waitGate.waitLabelAddress), 1,
+            IMAGE_SCN_MEM_READ)) {
+        error = "the timing path does not reference the expected aligned engine data";
+        return false;
+    }
+    if (requirements.mouseHooks) {
+        if (!ValidateMouseMoveEntry(module, error) ||
+            !ValidateRunGameTicUsercmdPath(module, error)) {
+            return false;
+        }
+    }
+    if (requirements.animationHooks) {
+        const auto* target = module + kClearEntityDefDynamicModelRva;
+        if (!ModuleRangeHasCharacteristics(
+                module, target, kClearEntityDefDynamicModelPrologue.size(),
+                executableCode) ||
+            std::memcmp(target, kClearEntityDefDynamicModelPrologue.data(),
+                        kClearEntityDefDynamicModelPrologue.size()) != 0) {
+            error = "R_ClearEntityDefDynamicModel runtime signature is incompatible";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ReadEngineCvarFloat(std::uintptr_t pointerRva, float& value) {
@@ -4948,9 +5112,10 @@ void TryInstallMouseMoveHook() {
     auto* module = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
     if (module == nullptr) return;
     auto* target = module + kMouseMoveRva;
-    if (std::memcmp(target, kMouseMovePrologue.data(),
-                    kMouseMovePrologue.size()) != 0) {
-        Log("error: idUsercmdGenLocal::MouseMove prologue mismatch; mouse interpolation disabled\r\n");
+    std::string validationError;
+    if (!ValidateMouseMoveEntry(module, validationError)) {
+        Log("error: " + validationError +
+            "; mouse interpolation disabled\r\n");
         g_mouseMoveHookState = 2;
         return;
     }
@@ -6121,14 +6286,40 @@ void ConfigureFromConfig(const preyhfr::Config& config) {
     }
 }
 
+preyhfr::CompatibilityRequirements CompatibilityForConfig(
+    const preyhfr::Config& config) {
+    preyhfr::CompatibilityRequirements requirements;
+    requirements.displayOverrides = config.resolution.has_value() ||
+        config.borderless ||
+        config.displayMode != preyhfr::DisplayMode::GameDefault ||
+        config.vSync != preyhfr::VSyncMode::GameDefault;
+    requirements.viewHook = config.viewLog || config.cameraInterpolation ||
+        (config.mouseInterpolation && config.cameraInterpolation);
+    requirements.cameraHook = config.cameraInterpolation ||
+        config.interpolationTrace;
+    requirements.entityHooks = config.viewModelInterpolation ||
+        config.worldInterpolation || config.viewModelAnimationInterpolation ||
+        config.worldAnimationInterpolation;
+    requirements.animationHooks = config.viewModelAnimationInterpolation ||
+        config.worldAnimationInterpolation;
+    requirements.mouseHooks = config.mouseInterpolation &&
+        config.cameraInterpolation;
+    requirements.asyncClockHooks = config.cameraInterpolation ||
+        config.interpolationTrace;
+    return requirements;
+}
+
 bool InstallConfiguredHooks(unsigned int cap) {
+    if (!InstallAsyncTimerInstrumentation()) {
+        Log("error: required async-timer import hooks were unavailable\r\n");
+        return false;
+    }
     if (g_borderlessRequested) {
         // Establish physical-pixel coordinates before the retail engine creates
         // its OpenGL window. This keeps custom renderer dimensions aligned with
         // the monitor rectangle on scaled Windows desktops.
         SetProcessDPIAware();
     }
-    InstallAsyncTimerInstrumentation();
     if (cap > 0 && g_frequency.QuadPart > 0) {
         g_periodCounts = std::max<std::int64_t>(1, g_frequency.QuadPart / cap);
         const TimerResolutionSnapshot before = QueryTimerResolution();
@@ -6162,7 +6353,8 @@ bool InstallConfiguredHooks(unsigned int cap) {
             Log("mouse: DINPUT!DirectInputCreateA observer installed\r\n");
         } else {
             g_directInputHookState = 2;
-            Log("error: DINPUT!DirectInputCreateA import was not found; mouse interpolation disabled\r\n");
+            Log("error: required DINPUT!DirectInputCreateA hook could not be installed\r\n");
+            return false;
         }
     }
     char buffer[896]{};
@@ -6292,15 +6484,23 @@ DWORD WINAPI BootstrapAsi(LPVOID) {
         g_initializationComplete.store(true, std::memory_order_release);
         return 1;
     }
-    const auto executableHash = preyhfr::Sha256File(*executablePath);
-    if (!executableHash || *executableHash != preyhfr::kSupportedExeSha256) {
-        LogBootstrapFailure(
-            "host validation",
-            "unsupported prey.exe SHA-256 " +
-                executableHash.value_or("unavailable"));
+    const auto compatibility = CompatibilityForConfig(config);
+    const fs::path gameDllPath =
+        executablePath->parent_path() / L"base" / L"gamex86.dll";
+    if (!preyhfr::ValidateExecutableLayout(*executablePath, compatibility,
+                                           error)) {
+        LogBootstrapFailure("host compatibility", error);
         g_initializationComplete.store(true, std::memory_order_release);
         return 1;
     }
+    if (!preyhfr::ValidateGameModuleLayout(gameDllPath, compatibility,
+                                           error)) {
+        LogBootstrapFailure("game-module compatibility", error);
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    Log("bootstrap: x86 PE layouts, required imports, exports, and configured "
+        "hook locations validated\r\n");
     ConfigureFromConfig(config);
     g_retailValidationState.store(0, std::memory_order_release);
     g_retailValidationEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -6328,19 +6528,22 @@ DWORD WINAPI BootstrapAsi(LPVOID) {
     }
     Log("bootstrap: early hooks installed in inactive state\r\n");
 
-    // A hooked engine cvar write waits on this validation while the bootstrap
-    // hashes the game module. This prevents renderer startup from outrunning
-    // validation without applying settings to an unsupported game DLL.
-    const fs::path gameDllPath =
-        executablePath->parent_path() / L"base" / L"gamex86.dll";
-    const auto gameDllHash = preyhfr::Sha256File(gameDllPath);
-    if (!gameDllHash || *gameDllHash != preyhfr::kSupportedGameDllSha256) {
+    // A hooked engine cvar write waits on this event while the protected main
+    // image is unpacked and its live timing path is structurally validated.
+    // No early hook is active until the complete compatibility gate succeeds.
+    preyhfr::WaitGateResult waitGate;
+    if (!g_waitGatePatch.WaitAndApply(30'000, waitGate, error)) {
         g_retailValidationState.store(2, std::memory_order_release);
         SetEvent(g_retailValidationEvent);
-        LogBootstrapFailure(
-            "game-module validation",
-            "unsupported base/gamex86.dll SHA-256 " +
-                gameDllHash.value_or("unavailable"));
+        LogBootstrapFailure("render-wait compatibility", error);
+        Shutdown();
+        g_initializationComplete.store(true, std::memory_order_release);
+        return 1;
+    }
+    if (!ValidateDeprotectedRuntime(compatibility, waitGate, error)) {
+        g_retailValidationState.store(2, std::memory_order_release);
+        SetEvent(g_retailValidationEvent);
+        LogBootstrapFailure("deprotected runtime compatibility", error);
         Shutdown();
         g_initializationComplete.store(true, std::memory_order_release);
         return 1;
@@ -6348,7 +6551,8 @@ DWORD WINAPI BootstrapAsi(LPVOID) {
     g_retailValidationState.store(1, std::memory_order_release);
     SetEvent(g_retailValidationEvent);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
-    Log("bootstrap: supported retail executable and game DLL validated\r\n");
+    Log("bootstrap: deprotected timing signature and referenced engine globals "
+        "validated\r\n");
 
     if (displayHooksAvailable && !WaitForDisplayOverrides(30'000, error)) {
         const bool restored = RestoreDisplayCvarHooks();
@@ -6361,13 +6565,6 @@ DWORD WINAPI BootstrapAsi(LPVOID) {
         DisableConfiguredRendererCvarOverrides();
     }
 
-    preyhfr::WaitGateResult waitGate;
-    if (!g_waitGatePatch.WaitAndApply(30'000, waitGate, error)) {
-        LogBootstrapFailure("render-wait patch", error);
-        Shutdown();
-        g_initializationComplete.store(true, std::memory_order_release);
-        return 1;
-    }
     g_comTicNumberAddress.store(waitGate.comTicAddress,
                                 std::memory_order_release);
     char waitGateMessage[320]{};

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PreyHFR VERSION 1.0.5 LANGUAGES CXX)
+project(PreyHFR VERSION 1.0.6 LANGUAGES CXX)
 
 set(PREYHFR_PRERELEASE "")
 if(PREYHFR_PRERELEASE)
@@ -40,6 +40,7 @@ target_include_directories(PreyHFRLauncher PRIVATE
 )
 
 add_library(PreyHFRCommon STATIC
+    src/common/compatibility.cpp
     src/common/config.cpp
     src/common/integrity.cpp
 )
@@ -68,6 +69,12 @@ add_executable(PreyHFRConfigTest
 )
 
 target_link_libraries(PreyHFRConfigTest PRIVATE PreyHFRCommon)
+
+add_executable(PreyHFRCompatibilityTest
+    src/compatibility_test/main.cpp
+)
+
+target_link_libraries(PreyHFRCompatibilityTest PRIVATE PreyHFRCommon)
 
 target_compile_definitions(PreyRuntimeDump PRIVATE
     NOMINMAX
@@ -111,6 +118,13 @@ target_compile_definitions(PreyHFRConfigTest PRIVATE
     WIN32_LEAN_AND_MEAN
 )
 
+target_compile_definitions(PreyHFRCompatibilityTest PRIVATE
+    NOMINMAX
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+)
+
 target_compile_options(PreyRuntimeDump PRIVATE
     /W4
     /permissive-
@@ -147,9 +161,14 @@ target_compile_options(PreyHFRConfigTest PRIVATE
     /EHsc
 )
 
+target_compile_options(PreyHFRCompatibilityTest PRIVATE
+    /W4
+    /permissive-
+    /EHsc
+)
+
 target_link_libraries(PreyRuntimeDump PRIVATE bcrypt)
-target_link_libraries(PreyHFRLauncher PRIVATE bcrypt)
-target_link_libraries(PreyHFRCommon PRIVATE bcrypt)
+target_link_libraries(PreyHFRLauncher PRIVATE PreyHFRCommon)
 target_link_libraries(PreyHFR PRIVATE PreyHFRCommon winmm)
 target_link_libraries(PreyHFRHookProbe PRIVATE gdi32)
 
@@ -173,6 +192,10 @@ set_target_properties(PreyHFRHookProbe PROPERTIES
 )
 
 set_target_properties(PreyHFRConfigTest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+set_target_properties(PreyHFRCompatibilityTest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
@@ -271,6 +294,11 @@ if(BUILD_TESTING)
         COMMAND PreyHFRLauncher --no-config --camera-interp
                 --timeline-reset-key F25 --validate-config
     )
+    add_test(NAME PreyHFRCompatibilityRejectsNonGameImages
+        COMMAND PreyHFRCompatibilityTest
+                "$<TARGET_FILE:PreyHFRLauncher>"
+                "$<TARGET_FILE:PreyHFR>"
+    )
     set_tests_properties(PreyHFRDisplayConflictRejection
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFRCompatibilityDependencyRejection
@@ -280,6 +308,8 @@ if(BUILD_TESTING)
     set_tests_properties(PreyHFREffectInterpolationDependencyRejection
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFRTimelineResetKeyRejection
+        PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(PreyHFRCompatibilityRejectsNonGameImages
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(
         PreyHFRConfigValidation
@@ -295,6 +325,7 @@ if(BUILD_TESTING)
         PreyHFREffectInterpolationDependencyRejection
         PreyHFRTimelineResetKeyValidation
         PreyHFRTimelineResetKeyRejection
+        PreyHFRCompatibilityRejectsNonGameImages
         PROPERTIES WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     set_tests_properties(PreyHFRConfigValidation PROPERTIES
         PASS_REGULAR_EXPRESSION

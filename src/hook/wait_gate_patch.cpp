@@ -10,19 +10,44 @@
 namespace preyhfr {
 namespace {
 
-constexpr std::array<std::uint8_t, 12> kWaitGatePattern{
+// idSessionLocal::Frame: test com_fixedTic, issue the GUI/event-loop command,
+// then compare com_ticNumber with the selected minimum tic. Immediates and the
+// object-relative store displacement are validated as image relationships.
+constexpr std::array<std::uint8_t, 47> kWaitGatePattern{
     0xa1, 0, 0, 0, 0,
     0x39, 0x58, 0x24,
     0x74, 0x02,
     0x8b, 0xf9,
+    0x8b, 0x0d, 0, 0, 0, 0,
+    0x8b, 0x11,
+    0x8b, 0x42, 0x20,
+    0x6a, 0x01,
+    0x68, 0, 0, 0, 0,
+    0xff, 0xd0,
+    0xa1, 0, 0, 0, 0,
+    0x3b, 0xc7,
+    0x89, 0x86, 0, 0, 0, 0,
+    0x7d, 0x1a,
 };
 constexpr std::array<bool, kWaitGatePattern.size()> kWaitGateMask{
     true, false, false, false, false,
     true, true, true,
     true, true,
     true, true,
+    true, true, false, false, false, false,
+    true, true,
+    true, true, true,
+    true, true,
+    true, false, false, false, false,
+    true, true,
+    true, false, false, false, false,
+    true, true,
+    true, true, false, false, false, false,
+    true, true,
 };
 constexpr std::size_t kPatchOffset = 8;
+constexpr std::size_t kEventLoopImmediateOffset = 14;
+constexpr std::size_t kWaitLabelImmediateOffset = 26;
 constexpr std::size_t kComTicImmediateOffset = 33;
 constexpr std::array<std::uint8_t, 2> kOriginalWaitBytes{0x74, 0x02};
 constexpr std::array<std::uint8_t, 2> kPatchedWaitBytes{0x90, 0x90};
@@ -146,15 +171,25 @@ bool WaitGatePatch::WaitAndApply(DWORD timeoutMilliseconds,
                 return false;
             }
             std::uint32_t fixedTicAddress = 0;
+            std::uint32_t eventLoopAddress = 0;
+            std::uint32_t waitLabelAddress = 0;
             std::uint32_t comTicAddress = 0;
             std::memcpy(&fixedTicAddress, text.data() + offset + 1,
                         sizeof(fixedTicAddress));
+            std::memcpy(&eventLoopAddress,
+                        text.data() + offset + kEventLoopImmediateOffset,
+                        sizeof(eventLoopAddress));
+            std::memcpy(&waitLabelAddress,
+                        text.data() + offset + kWaitLabelImmediateOffset,
+                        sizeof(waitLabelAddress));
             std::memcpy(&comTicAddress,
                         text.data() + offset + kComTicImmediateOffset,
                         sizeof(comTicAddress));
             const auto imageBegin = reinterpret_cast<std::uintptr_t>(image->base);
             const auto imageEnd = imageBegin + image->imageSize;
             if (fixedTicAddress < imageBegin || fixedTicAddress >= imageEnd ||
+                eventLoopAddress < imageBegin || eventLoopAddress >= imageEnd ||
+                waitLabelAddress < imageBegin || waitLabelAddress >= imageEnd ||
                 comTicAddress < imageBegin || comTicAddress >= imageEnd) {
                 error = "timing signature referenced data outside the executable";
                 return false;
@@ -172,6 +207,8 @@ bool WaitGatePatch::WaitAndApply(DWORD timeoutMilliseconds,
                 reinterpret_cast<std::uintptr_t>(waitGate),
                 comTicAddress,
                 fixedTicAddress,
+                eventLoopAddress,
+                waitLabelAddress,
                 alreadyPatched,
             };
             return true;

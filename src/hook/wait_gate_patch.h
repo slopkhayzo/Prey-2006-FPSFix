@@ -11,6 +11,8 @@ struct WaitGateResult {
     std::uintptr_t address = 0;
     std::uintptr_t comTicAddress = 0;
     std::uintptr_t fixedTicObjectPointerAddress = 0;
+    std::uintptr_t eventLoopObjectPointerAddress = 0;
+    std::uintptr_t waitLabelAddress = 0;
     bool alreadyPatched = false;
 };
 

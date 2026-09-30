@@ -29,27 +29,43 @@ directory described below; none of it is part of the project or its releases.
 > expect incompatibilities with multiplayer, demos, overlays, ReShade, or
 > other injectors until those combinations have been validated.
 
-## Supported game build
+## Compatible game builds
 
-The ASI remains inert unless both retail files have these SHA-256 hashes:
+Compatibility is determined from the code and data paths the enabled features
+actually use, not from a whole-file SHA-256 allowlist. Before activation the
+ASI requires the expected x86 PE32 layout, retail imports and `GetGameAPI`
+export, configured hook RVAs and game-DLL prologues, one unique deprotected
+engine timing path, and the expected relationships from that path to writable
+engine globals. Object/vtable hooks perform another relationship check when
+their runtime objects appear. Any absent or ambiguous prerequisite leaves the
+plugin inert and rolls back changes already owned by it.
+
+The fully tested baseline remains:
 
 | File | SHA-256 |
 | --- | --- |
 | `prey.exe` | `CEA6D424FBB8E2FFBF307A5BEE509B45C2D35242F70BE31387224DB2A0EADD69` |
 | `base/gamex86.dll` | `74D436D376BA144762A28C940D0243135B4F9DB8FDD7EE597B9CB5E4277B43C6` |
 
-Other releases are not patched. The plugin validates the files and the live
-timing signature at runtime; ambiguous or missing signatures are treated as
-errors and partially installed hooks are rolled back.
+An executable with a different hash can therefore be accepted when it preserves
+this verified layout and all required runtime paths. This is intended for
+layout-compatible variants, not arbitrary Prey releases; passing the gate is a
+safety/ABI check, not a claim that every such variant completed the gameplay
+validation matrix.
 
 ## Current status
 
-Version `1.0.5` extends the presentation timeline to renderer-only particle and
-material evaluation. Continuous effects such as fire now advance on every
-presented frame instead of holding one native 16 ms state and then jumping to
-the next. Gameplay FX spawning, scripts, sound, and simulation time remain on
-the original 62.5 Hz clock. Runtime testing at 350 and 360 FPS confirmed smooth
-fire motion with G-SYNC active.
+Version `1.0.6` replaces whole-file SHA-256 activation gates with fail-closed,
+feature-scoped structural compatibility validation. Differently hashed game
+files may now activate when they preserve the tested x86 PE layout, imports,
+exports, hook ABIs, deprotected timing/control-flow signatures, and referenced
+engine data relationships. The original Steam 1.4 hashes remain the fully
+tested baseline rather than an allowlist. Repeated baseline launches passed the
+new gate without an observed startup or runtime regression.
+
+The renderer-only particle/material clock added in 1.0.5 remains unchanged.
+Continuous effects such as fire advance on every presented frame while gameplay
+FX spawning, scripts, sound, and simulation stay on the original 62.5 Hz clock.
 
 The asynchronous-tic stabilization introduced in 1.0.4 remains unchanged. Only
 the confirmed native 16 ms timer thread receives its synthetic `timeGetTime`
@@ -71,7 +87,9 @@ for its presentation cap.
 
 Known limits:
 
-- Only the exact Steam 1.4 executable and game DLL listed above are supported.
+- The Steam 1.4 pair listed above is the fully tested baseline. Other file
+  identities must preserve its validated x86 layout, hook ABI, and runtime
+  relationships; layout-changing releases remain unsupported.
 - The ASI architecture has build/probe coverage, but its complete retail
   gameplay matrix through Ultimate ASI Loader must be repeated before release.
 - Multiplayer, demos, timedemos, overlays, ReShade, and other injectors are not
@@ -101,7 +119,7 @@ cmake --build build-x86 --target PreyHFRBundlePackage
 ```
 
 `PreyHFRPackage` creates and verifies the plugin-only
-`build-x86/release/PreyHFR-1.0.5-windows-x86.zip`.
+`build-x86/release/PreyHFR-1.0.6-windows-x86.zip`.
 `PreyHFRBundlePackage` creates the separate `-with-loader.zip`, pins and
 checksum-verifies Ultimate ASI Loader v9.7.4, and includes its upstream license
 and provenance. Neither build downloads dependencies.
@@ -175,7 +193,7 @@ use by another ASI plugin.
 
 ## Repository layout
 
-- `src/common`: strict ASI configuration and retail-file identity checks.
+- `src/common`: strict ASI configuration and structural compatibility checks.
 - `src/launcher`: unshipped historical/development comparison harness.
 - `src/hook`: ASI bootstrap, timing patch, presentation pacing,
   interpolation, input, and borderless hooks.
@@ -202,10 +220,11 @@ contains defense-in-depth exclusions for those materials.
 
 ## Contributing
 
-Keep changes fail-closed and version-specific. Do not submit copyrighted game
-assets or binaries. When adding support for another build, document hashes,
-use signatures with structural validation rather than fixed addresses, and
-verify clean rollback as well as high-rate behavior.
+Keep changes fail-closed and layout-specific. Do not submit copyrighted game
+assets or binaries. When adding support for another layout, document its file
+identity as provenance, add signatures with structural validation rather than
+unguarded fixed addresses, and verify clean rollback as well as high-rate
+behavior.
 
 ## License
 

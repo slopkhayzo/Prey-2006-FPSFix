@@ -23,13 +23,14 @@ endforeach()
 
 file(WRITE "${_package_dir}/PreyHFR-release.json"
 "{\n"
-"  \"manifest_format\": 1,\n"
+"  \"manifest_format\": 2,\n"
 "  \"name\": \"PreyHFR\",\n"
 "  \"version\": \"@PREYHFR_PACKAGE_VERSION@\",\n"
 "  \"target\": \"windows-x86\",\n"
-"  \"supported_retail_build\": {\n"
-"    \"prey.exe_sha256\": \"cea6d424fbb8e2ffbf307a5bee509b45c2d35242f70be31387224db2a0eadd69\",\n"
-"    \"base/gamex86.dll_sha256\": \"74d436d376ba144762a28c940d0243135b4f9db8fdd7ee597b9cb5e4277b43c6\"\n"
+"  \"compatibility\": {\n"
+"    \"policy\": \"prey-1.4-x86-structural-v1\",\n"
+"    \"tested_baseline_prey.exe_sha256\": \"cea6d424fbb8e2ffbf307a5bee509b45c2d35242f70be31387224db2a0eadd69\",\n"
+"    \"tested_baseline_gamex86.dll_sha256\": \"74d436d376ba144762a28c940d0243135b4f9db8fdd7ee597b9cb5e4277b43c6\"\n"
 "  },\n"
 "  \"files\": [\n${_file_entries}\n  ]\n"
 "}\n")

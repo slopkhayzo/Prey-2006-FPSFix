@@ -1,7 +1,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
-#include <bcrypt.h>
 
+#include "compatibility.h"
 #include "preyhfr_version.h"
 
 #include <algorithm>
@@ -29,16 +29,21 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr std::string_view kSupportedExeSha256 =
-    "cea6d424fbb8e2ffbf307a5bee509b45c2d35242f70be31387224db2a0eadd69";
-constexpr std::string_view kSupportedGameDllSha256 =
-    "74d436d376ba144762a28c940d0243135b4f9db8fdd7ee597b9cb5e4277b43c6";
-
-constexpr std::array<std::uint8_t, 12> kWaitGatePattern{
+constexpr std::array<std::uint8_t, 47> kWaitGatePattern{
     0xA1, 0, 0, 0, 0,       // mov eax, [com_fixedTic]
     0x39, 0x58, 0x24,       // cmp [eax+24h], ebx
     0x74, 0x02,             // je +2 (the two bytes replaced by NOPs)
     0x8B, 0xF9,             // mov edi, ecx
+    0x8B, 0x0D, 0, 0, 0, 0, // mov ecx, [eventLoop]
+    0x8B, 0x11,             // mov edx, [ecx]
+    0x8B, 0x42, 0x20,       // mov eax, [edx+20h]
+    0x6A, 0x01,             // push 1
+    0x68, 0, 0, 0, 0,      // push wait label
+    0xFF, 0xD0,             // call eax
+    0xA1, 0, 0, 0, 0,      // mov eax, [com_ticNumber]
+    0x3B, 0xC7,             // cmp eax, edi
+    0x89, 0x86, 0, 0, 0, 0,// mov [esi+lastGameTic], eax
+    0x7D, 0x1A,             // jge past the wait loop
 };
 
 constexpr std::array<bool, kWaitGatePattern.size()> kWaitGateMask{
@@ -46,9 +51,21 @@ constexpr std::array<bool, kWaitGatePattern.size()> kWaitGateMask{
     true, true, true,
     true, true,
     true, true,
+    true, true, false, false, false, false,
+    true, true,
+    true, true, true,
+    true, true,
+    true, false, false, false, false,
+    true, true,
+    true, false, false, false, false,
+    true, true,
+    true, true, false, false, false, false,
+    true, true,
 };
 
 constexpr std::size_t kPatchOffset = 8;
+constexpr std::size_t kEventLoopImmediateOffset = 14;
+constexpr std::size_t kWaitLabelImmediateOffset = 26;
 constexpr std::size_t kComTicImmediateOffset = 33;
 constexpr std::array<std::uint8_t, 2> kOriginalWaitBytes{0x74, 0x02};
 constexpr std::array<std::uint8_t, 2> kPatchedWaitBytes{0x90, 0x90};
@@ -742,42 +759,6 @@ std::optional<std::vector<std::uint8_t>> ReadFileBytes(const fs::path& path) {
     return bytes;
 }
 
-std::optional<std::string> Sha256(const std::vector<std::uint8_t>& bytes) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectLength = 0;
-    DWORD returned = 0;
-    std::vector<std::uint8_t> object;
-    std::array<std::uint8_t, 32> digest{};
-
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
-        BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                          reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
-                          &returned, 0) < 0) {
-        if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-        return std::nullopt;
-    }
-    object.resize(objectLength);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectLength,
-                         nullptr, 0, 0) < 0 ||
-        BCryptHashData(hash, const_cast<PUCHAR>(bytes.data()),
-                       static_cast<ULONG>(bytes.size()), 0) < 0 ||
-        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) {
-        if (hash) BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return std::nullopt;
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-
-    std::ostringstream result;
-    result << std::hex << std::setfill('0');
-    for (const auto byte : digest) {
-        result << std::setw(2) << static_cast<unsigned int>(byte);
-    }
-    return result.str();
-}
-
 std::optional<PeInfo> ParsePe(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() < sizeof(IMAGE_DOS_HEADER)) return std::nullopt;
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes.data());
@@ -967,6 +948,7 @@ std::optional<Match> FindWaitGate(HANDLE process, const RemoteModule& module,
         auto patchedPattern = kWaitGatePattern;
         patchedPattern[kPatchOffset] = kPatchedWaitBytes[0];
         patchedPattern[kPatchOffset + 1] = kPatchedWaitBytes[1];
+        if (text.size() < patchedPattern.size()) return std::nullopt;
         for (std::size_t offset = 0;
              offset <= text.size() - patchedPattern.size(); ++offset) {
             bool matched = true;
@@ -991,11 +973,21 @@ std::optional<Match> FindWaitGate(HANDLE process, const RemoteModule& module,
     if (text[offset + kComTicImmediateOffset - 1] != 0xA1) return std::nullopt;
     std::uint32_t comTicAddress = 0;
     std::uint32_t fixedTicAddress = 0;
+    std::uint32_t eventLoopAddress = 0;
+    std::uint32_t waitLabelAddress = 0;
     std::memcpy(&fixedTicAddress, text.data() + offset + 1, sizeof(fixedTicAddress));
+    std::memcpy(&eventLoopAddress,
+                text.data() + offset + kEventLoopImmediateOffset,
+                sizeof(eventLoopAddress));
+    std::memcpy(&waitLabelAddress,
+                text.data() + offset + kWaitLabelImmediateOffset,
+                sizeof(waitLabelAddress));
     std::memcpy(&comTicAddress, text.data() + offset + kComTicImmediateOffset,
                 sizeof(comTicAddress));
     if (comTicAddress < module.base || comTicAddress >= module.base + module.size ||
-        fixedTicAddress < module.base || fixedTicAddress >= module.base + module.size) {
+        fixedTicAddress < module.base || fixedTicAddress >= module.base + module.size ||
+        eventLoopAddress < module.base || eventLoopAddress >= module.base + module.size ||
+        waitLabelAddress < module.base || waitLabelAddress >= module.base + module.size) {
         return std::nullopt;
     }
     return Match{module.base + pe.textRva + offset,
@@ -2052,6 +2044,27 @@ bool StopTestProcess(PROCESS_INFORMATION& process) {
     return WaitForSingleObject(process.hProcess, 5'000) == WAIT_OBJECT_0;
 }
 
+preyhfr::CompatibilityRequirements CompatibilityForOptions(
+    const Options& options) {
+    preyhfr::CompatibilityRequirements requirements;
+    requirements.displayOverrides = options.borderless ||
+        options.displayMode != DisplayMode::Unspecified ||
+        options.vSync.has_value() || options.resolution.has_value();
+    requirements.viewHook = options.viewLog || options.cameraInterpolation ||
+        options.mouseInterpolation;
+    requirements.cameraHook = options.cameraInterpolation ||
+        options.interpolationTrace;
+    requirements.entityHooks = options.viewModelInterpolation ||
+        options.worldInterpolation || options.viewModelAnimationInterpolation ||
+        options.worldAnimationInterpolation;
+    requirements.animationHooks = options.viewModelAnimationInterpolation ||
+        options.worldAnimationInterpolation;
+    requirements.mouseHooks = options.mouseInterpolation;
+    requirements.asyncClockHooks = options.cameraInterpolation ||
+        options.interpolationTrace;
+    return requirements;
+}
+
 int Run(const Options& options) {
     const fs::path executable = options.gameDirectory / L"prey.exe";
     const fs::path gameDll = options.gameDirectory / L"base" / L"gamex86.dll";
@@ -2060,23 +2073,23 @@ int Run(const Options& options) {
         std::wcerr << L"Could not read " << executable << L"\n";
         return 2;
     }
-    const auto hash = Sha256(*fileBytes);
-    if (!hash || *hash != kSupportedExeSha256) {
-        std::cerr << "Unsupported prey.exe SHA-256: " << hash.value_or("unavailable")
+    const auto compatibility = CompatibilityForOptions(options);
+    std::string compatibilityError;
+    if (!preyhfr::ValidateExecutableLayout(
+            executable, compatibility, compatibilityError)) {
+        std::cerr << "Incompatible prey.exe: " << compatibilityError
                   << "\nNo process was started and no patch was applied.\n";
         return 3;
     }
-    const auto gameDllBytes = ReadFileBytes(gameDll);
-    const auto gameDllHash = gameDllBytes ? Sha256(*gameDllBytes) : std::nullopt;
-    if (!gameDllHash || *gameDllHash != kSupportedGameDllSha256) {
-        std::cerr << "Unsupported base/gamex86.dll SHA-256: "
-                  << gameDllHash.value_or("unavailable")
+    if (!preyhfr::ValidateGameModuleLayout(
+            gameDll, compatibility, compatibilityError)) {
+        std::cerr << "Incompatible base/gamex86.dll: " << compatibilityError
                   << "\nNo process was started and no patch was applied.\n";
         return 3;
     }
     const auto pe = ParsePe(*fileBytes);
     if (!pe) {
-        std::cerr << "Could not parse the supported executable's PE metadata.\n";
+        std::cerr << "Could not parse the compatible executable's PE metadata.\n";
         return 4;
     }
 
@@ -2144,7 +2157,8 @@ int Run(const Options& options) {
         return 5;
     }
 
-    std::wcout << L"Started supported Prey 1.4 process " << process.dwProcessId;
+    std::wcout << L"Started structurally compatible Prey process "
+               << process.dwProcessId;
     if (options.patchEnabled && !options.dryRun) {
         std::wcout << L" with its primary thread suspended";
     }
