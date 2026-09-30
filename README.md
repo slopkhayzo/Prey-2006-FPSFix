@@ -6,7 +6,7 @@
 > kind of reverse-engineering by myself; I've tested the entire game at 360hz + 
 > briefly tested at 120, 144 and 240 and so far spotted 
 > no major issues (on my machine ofc, if you have issues feel free to open an Issue).
-> If you're interested and want more (human generated) info, I have a blog post [here](https://slop-blog.enkhayzomachines.net/posts/dishonored-doto-high-fps-fix) :)
+> If you're interested and want more (human generated) info, I have a blog post [here](https://slop-blog.enkhayzomachines.net/posts/prey-2006-high-fps-fix) :)
 
 PreyHFR is an experimental high-frame-rate presentation fix for the Windows
 Steam release of *Prey* (2006) 1.4. It keeps the original 16 ms (62.5 Hz)
