@@ -206,7 +206,6 @@ install(TARGETS PreyHFR
 
 install(FILES
     PreyHFR.ini
-    uninstall-preyhfr.cmd
     DESTINATION .
 )
 install(FILES packaging/PreyHFR-README.txt DESTINATION .)

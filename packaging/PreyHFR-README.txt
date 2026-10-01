@@ -177,10 +177,10 @@ https://github.com/slopkhayzo/Prey-2006-FPSFix
 UNINSTALLING
 ------------
 
-Close the game and run uninstall-preyhfr.cmd. It removes only files owned by
-PreyHFR. It intentionally does not remove dinput.dll: the external loader is
-shared infrastructure and another installed ASI may depend on it. Remove that
-loader separately only after checking its other users.
+Close the game and delete PreyHFR.asi, PreyHFR.ini, PreyHFR.log,
+PreyHFR-README.txt, PreyHFR-LICENSE.txt, and PreyHFR-release.json. Loader-bundle
+files such as dinput.dll are shared third-party infrastructure; remove them
+separately only after checking that no other ASI plugin depends on them.
 
 
 LICENSE

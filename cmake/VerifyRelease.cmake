@@ -10,7 +10,6 @@ endif()
 set(_payload_files
     "PreyHFR.asi"
     "PreyHFR.ini"
-    "uninstall-preyhfr.cmd"
     "PreyHFR-README.txt"
     "PreyHFR-LICENSE.txt"
 )

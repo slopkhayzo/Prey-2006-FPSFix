@@ -49,7 +49,6 @@ set(_expected_files
     "Ultimate-ASI-Loader-release.json"
     "dinput.dll"
     "dinput.ini"
-    "uninstall-preyhfr.cmd"
 )
 file(GLOB_RECURSE _actual_files LIST_DIRECTORIES false
      RELATIVE "${BUNDLE_DIR}" "${BUNDLE_DIR}/*")

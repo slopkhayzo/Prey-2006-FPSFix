@@ -186,10 +186,11 @@ presentation-only recovery as a fallback; it defaults to `F10`, accepts `F1`
 through `F24`, and can be disabled with `none`. Pressing it does not alter the
 simulation or save state.
 
-To remove a packaged copy, close the game and run
-`uninstall-preyhfr.cmd`; it removes only PreyHFR-owned files. It intentionally
-does not remove `dinput.dll`, because that shared third-party loader may be in
-use by another ASI plugin.
+To remove a packaged copy, close the game and delete `PreyHFR.asi`,
+`PreyHFR.ini`, `PreyHFR.log`, `PreyHFR-README.txt`,
+`PreyHFR-LICENSE.txt`, and `PreyHFR-release.json`. Loader-bundle files such as
+`dinput.dll` are shared third-party infrastructure; remove them separately only
+after checking that no other ASI plugin depends on them.
 
 ## Repository layout
 
