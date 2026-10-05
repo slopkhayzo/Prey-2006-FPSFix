@@ -37,9 +37,6 @@ struct Config {
     double maximumWorldEntityDistance = 128.0;
     double maximumWorldEntityAngle = 90.0;
     bool mouseInterpolation = false;
-    bool continuousSnapshotTiming = true;
-    bool multiTicEntityAlignment = true;
-    bool overdueSnapshotFallback = true;
     bool interpolationTrace = false;
     unsigned int timelineResetVirtualKey = 0x79; // VK_F10
     bool borderless = false;

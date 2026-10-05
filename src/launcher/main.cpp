@@ -103,9 +103,6 @@ struct Options {
     double maximumWorldEntityDistance = 128.0;
     double maximumWorldEntityAngle = 90.0;
     bool mouseInterpolation = false;
-    bool continuousSnapshotTiming = true;
-    bool multiTicEntityAlignment = true;
-    bool overdueSnapshotFallback = true;
     bool interpolationTrace = false;
     unsigned int timelineResetVirtualKey = VK_F10;
     bool borderless = false;
@@ -442,6 +439,7 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
         "interpolation.effects", "interpolation.mouse",
         "interpolation.world_max_distance",
         "interpolation.world_max_angle",
+        // Retired runtime switches retained as ignored input for old INIs.
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
         "compatibility.overdue_snapshot_fallback",
@@ -522,12 +520,6 @@ bool LoadConfiguration(const fs::path& path, Options& options, std::string& erro
                      options.worldAnimationInterpolation) ||
         !readBoolean("interpolation.effects", options.effectInterpolation) ||
         !readBoolean("interpolation.mouse", options.mouseInterpolation) ||
-        !readBoolean("compatibility.continuous_snapshot_timing",
-                     options.continuousSnapshotTiming) ||
-        !readBoolean("compatibility.multi_tic_entity_alignment",
-                     options.multiTicEntityAlignment) ||
-        !readBoolean("compatibility.overdue_snapshot_fallback",
-                     options.overdueSnapshotFallback) ||
         !readBoolean("diagnostics.view_log", options.viewLog) ||
         !readBoolean("diagnostics.interpolation_trace",
                      options.interpolationTrace) ||
@@ -652,10 +644,7 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                                                           bool effectInterpolation,
                                                           double maximumWorldEntityDistance,
                                                           double maximumWorldEntityAngle,
-                                                          bool mouseInterpolation,
-                                                          bool continuousSnapshotTiming,
-                                                          bool multiTicEntityAlignment,
-                                                          bool overdueSnapshotFallback,
+                                                           bool mouseInterpolation,
                                                           bool interpolationTrace,
                                                           unsigned int timelineResetVirtualKey,
                                                           bool borderless,
@@ -679,9 +668,6 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
             !EnvironmentEntryHasName(entry, L"PREYHFR_WORLD_MAX_DISTANCE") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_WORLD_MAX_ANGLE") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_MOUSE_INTERP") &&
-            !EnvironmentEntryHasName(entry, L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING") &&
-            !EnvironmentEntryHasName(entry, L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT") &&
-            !EnvironmentEntryHasName(entry, L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_INTERPOLATION_TRACE") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_TIMELINE_RESET_KEY") &&
             !EnvironmentEntryHasName(entry, L"PREYHFR_BORDERLESS") &&
@@ -713,12 +699,6 @@ std::optional<std::vector<wchar_t>> BuildChildEnvironment(unsigned int cap,
                       std::to_wstring(maximumWorldEntityAngle));
     entries.push_back(std::wstring(L"PREYHFR_MOUSE_INTERP=") +
                       (mouseInterpolation ? L"1" : L"0"));
-    entries.push_back(std::wstring(L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING=") +
-                      (continuousSnapshotTiming ? L"1" : L"0"));
-    entries.push_back(std::wstring(L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT=") +
-                      (multiTicEntityAlignment ? L"1" : L"0"));
-    entries.push_back(std::wstring(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK=") +
-                      (overdueSnapshotFallback ? L"1" : L"0"));
     entries.push_back(std::wstring(L"PREYHFR_INTERPOLATION_TRACE=") +
                       (interpolationTrace ? L"1" : L"0"));
     entries.push_back(L"PREYHFR_TIMELINE_RESET_KEY=" +
@@ -1143,18 +1123,6 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
             options.mouseInterpolation = true;
         } else if (argument == L"--no-mouse-interp") {
             options.mouseInterpolation = false;
-        } else if (argument == L"--continuous-snapshot-timing") {
-            options.continuousSnapshotTiming = true;
-        } else if (argument == L"--no-continuous-snapshot-timing") {
-            options.continuousSnapshotTiming = false;
-        } else if (argument == L"--multi-tic-entity-alignment") {
-            options.multiTicEntityAlignment = true;
-        } else if (argument == L"--no-multi-tic-entity-alignment") {
-            options.multiTicEntityAlignment = false;
-        } else if (argument == L"--overdue-snapshot-fallback") {
-            options.overdueSnapshotFallback = true;
-        } else if (argument == L"--no-overdue-snapshot-fallback") {
-            options.overdueSnapshotFallback = false;
         } else if (argument == L"--interpolation-trace") {
             options.interpolationTrace = true;
         } else if (argument == L"--no-interpolation-trace") {
@@ -1216,10 +1184,7 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
                            L"[--world-anim-interp] "
                            L"[--effects-interp|--no-effects-interp] "
                            L"[--world-max-distance N] [--world-max-angle N] "
-                           L"[--mouse-interp] "
-                           L"[--continuous-snapshot-timing] "
-                           L"[--multi-tic-entity-alignment] "
-                           L"[--overdue-snapshot-fallback] "
+                            L"[--mouse-interp] "
                            L"[--interpolation-trace|--no-interpolation-trace] "
                            L"[--timeline-reset-key F1..F24|none] "
                            L"[--windowed|--exclusive|--borderless] "
@@ -1260,18 +1225,6 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv, Options options) {
     }
     if (options.interpolationTrace && !options.cameraInterpolation) {
         std::wcerr << L"--interpolation-trace requires --camera-interp.\n";
-        return std::nullopt;
-    }
-    if (options.multiTicEntityAlignment &&
-        !options.continuousSnapshotTiming) {
-        std::wcerr << L"Multi-tic entity alignment requires continuous snapshot "
-                      L"timing. Disable both to select RC1 behavior.\n";
-        return std::nullopt;
-    }
-    if (options.overdueSnapshotFallback &&
-        !options.multiTicEntityAlignment) {
-        std::wcerr << L"The overdue snapshot fallback requires multi-tic entity "
-                      L"alignment. Disable both to select RC2 behavior.\n";
         return std::nullopt;
     }
     if (options.borderless && options.displayMode == DisplayMode::Exclusive) {
@@ -2109,9 +2062,6 @@ int Run(const Options& options) {
                                                  options.maximumWorldEntityDistance,
                                                  options.maximumWorldEntityAngle,
                                                  options.mouseInterpolation,
-                                                 options.continuousSnapshotTiming,
-                                                 options.multiTicEntityAlignment,
-                                                 options.overdueSnapshotFallback,
                                                  options.interpolationTrace,
                                                  options.timelineResetVirtualKey,
                                                  options.borderless,
@@ -2183,12 +2133,6 @@ int Run(const Options& options) {
                   << (options.effectInterpolation ? "enabled" : "disabled")
                   << "; mouse interpolation is "
                   << (options.mouseInterpolation ? "enabled" : "disabled")
-                  << "; continuous snapshot timing is "
-                  << (options.continuousSnapshotTiming ? "enabled" : "disabled")
-                  << "; multi-tic entity alignment is "
-                  << (options.multiTicEntityAlignment ? "enabled" : "disabled")
-                  << "; overdue snapshot fallback is "
-                  << (options.overdueSnapshotFallback ? "enabled" : "disabled")
                   << "; interpolation trace is "
                   << (options.interpolationTrace ? "enabled" : "disabled")
                   << "; timeline reset key is "
@@ -2420,12 +2364,6 @@ int wmain(int argc, wchar_t** argv) {
                       << (options->effectInterpolation ? "on" : "off")
                       << "; mouse="
                       << (options->mouseInterpolation ? "on" : "off")
-                      << "; continuous_snapshot_timing="
-                      << (options->continuousSnapshotTiming ? "on" : "off")
-                      << "; multi_tic_entity_alignment="
-                      << (options->multiTicEntityAlignment ? "on" : "off")
-                      << "; overdue_snapshot_fallback="
-                      << (options->overdueSnapshotFallback ? "on" : "off")
                       << "; interpolation_trace="
                       << (options->interpolationTrace ? "on" : "off")
                       << "; timeline_reset_key="

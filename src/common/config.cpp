@@ -202,6 +202,9 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
         "interpolation.effects", "interpolation.mouse",
         "interpolation.world_max_distance",
         "interpolation.world_max_angle",
+        // Retired after native-clock stabilization. Accept these names so an
+        // existing RC-era INI remains loadable, but do not restore the old
+        // runtime branches.
         "compatibility.continuous_snapshot_timing",
         "compatibility.multi_tic_entity_alignment",
         "compatibility.overdue_snapshot_fallback",
@@ -281,12 +284,6 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
                      config.worldAnimationInterpolation) ||
         !readBoolean("interpolation.effects", config.effectInterpolation) ||
         !readBoolean("interpolation.mouse", config.mouseInterpolation) ||
-        !readBoolean("compatibility.continuous_snapshot_timing",
-                     config.continuousSnapshotTiming) ||
-        !readBoolean("compatibility.multi_tic_entity_alignment",
-                     config.multiTicEntityAlignment) ||
-        !readBoolean("compatibility.overdue_snapshot_fallback",
-                     config.overdueSnapshotFallback) ||
         !readBoolean("diagnostics.view_log", config.viewLog) ||
         !readBoolean("diagnostics.interpolation_trace",
                      config.interpolationTrace) ||
@@ -402,14 +399,6 @@ bool LoadConfig(const std::filesystem::path& path, Config& config,
                        "diagnostics.interpolation_trace")) {
         return false;
     }
-    if (config.multiTicEntityAlignment && !config.continuousSnapshotTiming) {
-        error = "compatibility.multi_tic_entity_alignment requires continuous_snapshot_timing";
-        return false;
-    }
-    if (config.overdueSnapshotFallback && !config.multiTicEntityAlignment) {
-        error = "compatibility.overdue_snapshot_fallback requires multi_tic_entity_alignment";
-        return false;
-    }
     if (config.borderless && config.displayMode == DisplayMode::Exclusive) {
         error = "display.borderless cannot be combined with display.mode=exclusive";
         return false;
@@ -470,12 +459,6 @@ std::string DescribeConfig(const Config& config) {
            << (config.worldAnimationInterpolation ? "on" : "off")
            << "; effects=" << (config.effectInterpolation ? "on" : "off")
            << "; mouse=" << (config.mouseInterpolation ? "on" : "off")
-           << "; continuous_snapshot_timing="
-           << (config.continuousSnapshotTiming ? "on" : "off")
-           << "; multi_tic_entity_alignment="
-           << (config.multiTicEntityAlignment ? "on" : "off")
-           << "; overdue_snapshot_fallback="
-           << (config.overdueSnapshotFallback ? "on" : "off")
            << "; interpolation_trace="
            << (config.interpolationTrace ? "on" : "off")
            << "; timeline_reset_key="

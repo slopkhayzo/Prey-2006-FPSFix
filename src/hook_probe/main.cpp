@@ -99,9 +99,6 @@ int wmain(int argc, wchar_t** argv) {
     SetEnvironmentVariableW(L"PREYHFR_PROBE", L"1");
     SetEnvironmentVariableW(L"PREYHFR_CAP", std::to_wstring(cap).c_str());
     SetEnvironmentVariableW(L"PREYHFR_LOG", log.c_str());
-    SetEnvironmentVariableW(L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING", L"1");
-    SetEnvironmentVariableW(L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT", L"1");
-    SetEnvironmentVariableW(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK", L"1");
     SetEnvironmentVariableW(L"PREYHFR_BORDERLESS", L"1");
     SetProcessDPIAware();
     SetEnvironmentVariableW(

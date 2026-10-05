@@ -246,6 +246,10 @@ if(BUILD_TESTING)
     add_test(NAME PreyHFRConfigValidation
         COMMAND PreyHFRConfigTest "${CMAKE_SOURCE_DIR}/PreyHFR.ini"
     )
+    add_test(NAME PreyHFRLegacyCompatibilityConfigValidation
+        COMMAND PreyHFRConfigTest
+                "${CMAKE_SOURCE_DIR}/tests/legacy-compatibility.ini"
+    )
     add_test(NAME PreyHFRHookProbe144
         COMMAND PreyHFRHookProbe 144 2
     )
@@ -261,18 +265,6 @@ if(BUILD_TESTING)
     )
     add_test(NAME PreyHFRDisplayConflictRejection
         COMMAND PreyHFRLauncher --no-config --borderless --exclusive
-                --validate-config
-    )
-    add_test(NAME PreyHFRRC1CompatibilityValidation
-        COMMAND PreyHFRLauncher --no-config
-                --no-continuous-snapshot-timing
-                --no-multi-tic-entity-alignment
-                --no-overdue-snapshot-fallback
-                --validate-config
-    )
-    add_test(NAME PreyHFRCompatibilityDependencyRejection
-        COMMAND PreyHFRLauncher --no-config
-                --no-continuous-snapshot-timing
                 --validate-config
     )
     add_test(NAME PreyHFRInterpolationTraceValidation
@@ -307,8 +299,6 @@ if(BUILD_TESTING)
     )
     set_tests_properties(PreyHFRDisplayConflictRejection
         PROPERTIES WILL_FAIL TRUE)
-    set_tests_properties(PreyHFRCompatibilityDependencyRejection
-        PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFRInterpolationTraceDependencyRejection
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(PreyHFREffectInterpolationDependencyRejection
@@ -319,12 +309,11 @@ if(BUILD_TESTING)
         PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(
         PreyHFRConfigValidation
+        PreyHFRLegacyCompatibilityConfigValidation
         PreyHFRHookProbe144
         PreyHFRDisplayOptionsValidation
         PreyHFRConfigOverrideValidation
         PreyHFRDisplayConflictRejection
-        PreyHFRRC1CompatibilityValidation
-        PreyHFRCompatibilityDependencyRejection
         PreyHFRInterpolationTraceValidation
         PreyHFRInterpolationTraceDependencyRejection
         PreyHFREffectInterpolationValidation

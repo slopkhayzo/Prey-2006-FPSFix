@@ -244,9 +244,6 @@ bool g_worldInterpolationRequested = false;
 bool g_worldAnimationInterpolationRequested = false;
 bool g_effectInterpolationRequested = false;
 bool g_mouseInterpolationRequested = false;
-bool g_continuousSnapshotTimingRequested = false;
-bool g_multiTicEntityAlignmentRequested = false;
-bool g_overdueSnapshotFallbackRequested = false;
 bool g_interpolationTraceRequested = false;
 unsigned int g_timelineResetVirtualKey = 0;
 bool g_timelineResetKeyDown = false;
@@ -404,7 +401,6 @@ struct ViewCounters {
     std::uint64_t discontinuities = 0;
     std::uint64_t viewIdChanges = 0;
     std::uint64_t interpolatedViews = 0;
-    std::uint64_t extrapolatedViews = 0;
     std::uint64_t snappedViews = 0;
     std::uint64_t interpolationResets = 0;
     std::uint64_t resetTimeDelta = 0;
@@ -430,14 +426,6 @@ struct ViewCounters {
     std::uint64_t worldAnimationSkips = 0;
     std::uint64_t worldEntityResets = 0;
     std::uint64_t worldEntityCapacitySkips = 0;
-    std::uint64_t viewModelLatestTicRoots = 0;
-    std::uint64_t viewModelLatestTicAnimations = 0;
-    std::uint64_t worldLatestTicRoots = 0;
-    std::uint64_t worldLatestTicAnimations = 0;
-    std::uint64_t viewModelPendingRoots = 0;
-    std::uint64_t viewModelPendingAnimations = 0;
-    std::uint64_t worldPendingRoots = 0;
-    std::uint64_t worldPendingAnimations = 0;
     std::uint64_t presentationCandidateRebuilds = 0;
     std::uint64_t presentationCandidateSourceScans = 0;
     std::uint64_t presentationCandidateVisits = 0;
@@ -561,7 +549,6 @@ struct TrackedJointAnimation {
     bool canInterpolate = false;
     bool cacheWasInterpolated = false;
     std::uint64_t transitionGeneration = 0;
-    std::uint32_t transitionSamples = 0;
     const JointMatrix* sourceJoints = nullptr;
     std::vector<JointMatrix> previous;
     std::vector<JointMatrix> current;
@@ -596,7 +583,6 @@ struct TrackedRenderEntity {
     bool hasCurrent = false;
     bool canInterpolate = false;
     std::uint64_t transitionGeneration = 0;
-    std::uint32_t transitionSamples = 0;
     std::uint64_t firstInterpolatableGeneration = 0;
     const void* validatedLiveEntity = nullptr;
     ViewEntityPose previous{};
@@ -1951,7 +1937,6 @@ void ResetTrackedEntityInterpolation() {
         if (entity == nullptr || !entity->hasCurrent) continue;
         entity->previous = entity->current;
         entity->canInterpolate = false;
-        entity->transitionSamples = 0;
         if (entity->animation.hasCurrent) {
             entity->animation.previous = entity->animation.current;
             SnapJointInterpolationSpans(
@@ -1959,7 +1944,6 @@ void ResetTrackedEntityInterpolation() {
                 entity->animation.current.size(),
                 entity->animation.interpolationSpans);
             entity->animation.canInterpolate = false;
-            entity->animation.transitionSamples = 0;
         }
     }
 }
@@ -2229,7 +2213,6 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
             animation.hasCurrent = true;
             animation.canInterpolate = false;
             animation.transitionGeneration = g_cameraSnapshotGeneration + 1;
-            animation.transitionSamples = 0;
             animation.sourceJoints = joints;
             if (tracked.allowViewId == 0) {
                 g_trackedWorldJointMatrices =
@@ -2257,15 +2240,10 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
             SnapJointInterpolationSpans(
                 joints, jointCount, animation.interpolationSpans);
             animation.transitionGeneration = transitionGeneration;
-            animation.transitionSamples = 0;
             animation.sourceJoints = joints;
             animation.canInterpolate = false;
             return;
         }
-        const std::uint32_t transitionSamples =
-            animation.transitionGeneration == transitionGeneration
-                ? (std::min)(animation.transitionSamples + 1u, 3u)
-                : 1u;
         animation.previous.swap(animation.current);
         std::memcpy(animation.current.data(), joints,
                     jointCount * sizeof(joints[0]));
@@ -2273,7 +2251,6 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
             animation.previous.data(), animation.current.data(), jointCount,
             animation.interpolationSpans);
         animation.transitionGeneration = transitionGeneration;
-        animation.transitionSamples = transitionSamples;
         animation.sourceJoints = joints;
         animation.canInterpolate =
             transitionGeneration >= tracked.firstInterpolatableGeneration;
@@ -2409,7 +2386,6 @@ void ObserveRenderEntity(int handle, const void* renderEntity, bool created) {
         tracked->current = pose;
         tracked->hasCurrent = true;
         tracked->canInterpolate = false;
-        tracked->transitionSamples = 0;
         return;
     }
     if (std::memcmp(&pose, &tracked->current, sizeof(pose)) == 0) return;
@@ -2433,20 +2409,14 @@ void ObserveRenderEntity(int handle, const void* renderEntity, bool created) {
         tracked->current = pose;
         tracked->canInterpolate = false;
         tracked->transitionGeneration = transitionGeneration;
-        tracked->transitionSamples = 0;
         if (worldEntity && thresholdReset) {
             ++g_viewCounters.worldEntityResets;
         }
     } else {
-        const std::uint32_t transitionSamples =
-            tracked->transitionGeneration == transitionGeneration
-                ? (std::min)(tracked->transitionSamples + 1u, 3u)
-                : 1u;
         tracked->previous = tracked->current;
         tracked->current = pose;
         tracked->canInterpolate = true;
         tracked->transitionGeneration = transitionGeneration;
-        tracked->transitionSamples = transitionSamples;
     }
 }
 
@@ -2687,23 +2657,8 @@ void RefreshPresentationCandidates() {
         static_cast<std::uint64_t>(g_presentationCandidateCount));
 }
 
-double EntityInterpolationAlpha(bool pending, std::uint32_t transitionSamples,
-                                double cameraAlpha, double latestTicAlpha,
-                                double pendingTicAlpha,
-                                bool multiTicEntityAlignment,
-                                bool overdueSnapshotFallback);
-double AnimationInterpolationAlpha(bool pending,
-                                   std::uint32_t transitionSamples,
-                                   double cameraAlpha,
-                                   double latestTicAlpha,
-                                   double pendingTicAlpha,
-                                   bool multiTicEntityAlignment,
-                                   bool overdueSnapshotFallback);
-
 std::size_t ApplyInterpolatedRenderEntities(
-    int viewId, double cameraAlpha, double latestTicAlpha,
-    double pendingTicAlpha,
-    bool cameraInterpolated,
+    int viewId, double cameraAlpha, bool cameraInterpolated,
     const MouseOverlay& mouseOverlay,
     std::array<AppliedViewEntityPose, kMaximumAppliedEntityPoses>& applied) {
     if ((!g_viewModelInterpolationRequested && !g_worldInterpolationRequested &&
@@ -2728,10 +2683,7 @@ std::size_t ApplyInterpolatedRenderEntities(
         const bool viewModel = tracked->allowViewId != 0;
         const bool currentPose = tracked->canInterpolate &&
             tracked->transitionGeneration == g_cameraSnapshotGeneration;
-        const bool pendingPose = g_overdueSnapshotFallbackRequested &&
-            tracked->canInterpolate &&
-            tracked->transitionGeneration == g_cameraSnapshotGeneration + 1;
-        const bool interpolatePose = currentPose || pendingPose;
+        const bool interpolatePose = currentPose;
         const bool applyRoot = viewModel
             ? g_viewModelInterpolationRequested &&
                   tracked->allowViewId == viewId &&
@@ -2747,14 +2699,10 @@ std::size_t ApplyInterpolatedRenderEntities(
         const bool currentAnimation = tracked->animation.canInterpolate &&
             tracked->animation.transitionGeneration ==
                 g_cameraSnapshotGeneration;
-        const bool pendingAnimation = g_overdueSnapshotFallbackRequested &&
-            tracked->animation.canInterpolate &&
-            tracked->animation.transitionGeneration ==
-                g_cameraSnapshotGeneration + 1;
         const bool applyAnimation = animationRequested &&
             animationMatchesView && cameraInterpolated &&
             tracked->animation.hasCurrent &&
-            (currentAnimation || pendingAnimation);
+            currentAnimation;
         const bool restoreAnimationCache = animationRequested &&
             animationMatchesView &&
             tracked->animation.cacheWasInterpolated && !applyAnimation;
@@ -2830,27 +2778,7 @@ std::size_t ApplyInterpolatedRenderEntities(
         }
 
         if (applyRoot) {
-            const bool useLatestTicAlpha =
-                g_multiTicEntityAlignmentRequested &&
-                tracked->transitionSamples > 1;
-            const double rootAlpha = EntityInterpolationAlpha(
-                pendingPose, tracked->transitionSamples, cameraAlpha,
-                latestTicAlpha, pendingTicAlpha,
-                g_multiTicEntityAlignmentRequested,
-                g_overdueSnapshotFallbackRequested);
-            if (pendingPose) {
-                if (viewModel) {
-                    ++g_viewCounters.viewModelPendingRoots;
-                } else {
-                    ++g_viewCounters.worldPendingRoots;
-                }
-            } else if (useLatestTicAlpha) {
-                if (viewModel) {
-                    ++g_viewCounters.viewModelLatestTicRoots;
-                } else {
-                    ++g_viewCounters.worldLatestTicRoots;
-                }
-            }
+            const double rootAlpha = cameraAlpha;
             ViewEntityPose interpolatedPose;
             const ViewEntityPose& previousPose = tracked->previous;
             const ViewEntityPose& currentPoseValue = tracked->current;
@@ -2886,28 +2814,7 @@ std::size_t ApplyInterpolatedRenderEntities(
             }
         }
         if (applyAnimation) {
-            const bool useLatestTicAlpha =
-                g_multiTicEntityAlignmentRequested &&
-                tracked->animation.transitionSamples > 1;
-            const double animationAlpha = AnimationInterpolationAlpha(
-                pendingAnimation, tracked->animation.transitionSamples,
-                cameraAlpha, latestTicAlpha, pendingTicAlpha,
-                g_multiTicEntityAlignmentRequested,
-                g_overdueSnapshotFallbackRequested);
-            if (pendingAnimation) {
-                if (viewModel) {
-                    ++g_viewCounters.viewModelPendingAnimations;
-                } else {
-                    ++g_viewCounters.worldPendingAnimations;
-                }
-            } else if (useLatestTicAlpha) {
-                if (viewModel) {
-                    ++g_viewCounters.viewModelLatestTicAnimations;
-                } else {
-                    ++g_viewCounters.worldLatestTicAnimations;
-                }
-            }
-            InterpolateJointMatrices(tracked->animation, animationAlpha);
+            InterpolateJointMatrices(tracked->animation, cameraAlpha);
             saved.originalJoints = ReadUnaligned<void*>(
                 live, kRenderEntityJointsOffset);
             WriteUnaligned(live, kRenderEntityJointsOffset,
@@ -2965,16 +2872,9 @@ void RestoreRenderEntities(
     }
 }
 
-bool IsInterpolatableCameraIntervalForMode(std::int64_t milliseconds,
-                                           bool continuousSnapshotTiming) {
-    return milliseconds == kNativeTicMilliseconds ||
-           (continuousSnapshotTiming &&
-            milliseconds == kMaximumInterpolatedCameraIntervalMilliseconds);
-}
-
 bool IsInterpolatableCameraInterval(std::int64_t milliseconds) {
-    return IsInterpolatableCameraIntervalForMode(
-        milliseconds, g_continuousSnapshotTimingRequested);
+    return milliseconds == kNativeTicMilliseconds ||
+           milliseconds == kMaximumInterpolatedCameraIntervalMilliseconds;
 }
 
 bool IsConsecutiveProducedCameraBridge(std::int32_t consumedTime,
@@ -3111,11 +3011,10 @@ bool CameraSnapshotClockDebtExceeded(std::int64_t currentSnapshotQpc,
     return nowQpc - predictedSnapshotQpc > maximumSupportedDebtQpc;
 }
 
-double CameraInterpolationAlphaForMode(std::int32_t intervalMilliseconds,
-                                       std::int64_t nowQpc,
-                                       std::int64_t currentSnapshotQpc,
-                                       std::int64_t frequency,
-                                       bool overdueSnapshotFallback) {
+double CameraInterpolationAlpha(std::int32_t intervalMilliseconds,
+                                std::int64_t nowQpc,
+                                std::int64_t currentSnapshotQpc,
+                                std::int64_t frequency) {
     if (intervalMilliseconds <= 0 || frequency <= 0) return 1.0;
     const double intervalSeconds =
         static_cast<double>(intervalMilliseconds) / 1000.0;
@@ -3127,22 +3026,10 @@ double CameraInterpolationAlphaForMode(std::int32_t intervalMilliseconds,
     // 16 ms transition this reduces to elapsed / 16 ms.  If a presentation
     // samples two simulation tics at once (common at 60 Hz), begin halfway
     // through the observed 32 ms span instead of snapping across it.
-    const double maximumAlpha = overdueSnapshotFallback
-        ? 1.0 + kNativeTicSeconds / intervalSeconds
-        : 1.0;
     return std::clamp(
         (intervalSeconds + elapsedSeconds - kNativeTicSeconds) /
             intervalSeconds,
-        0.0, maximumAlpha);
-}
-
-double CameraInterpolationAlpha(std::int32_t intervalMilliseconds,
-                                std::int64_t nowQpc,
-                                std::int64_t currentSnapshotQpc,
-                                std::int64_t frequency) {
-    return CameraInterpolationAlphaForMode(
-        intervalMilliseconds, nowQpc, currentSnapshotQpc, frequency,
-        g_overdueSnapshotFallbackRequested);
+        0.0, 1.0);
 }
 
 double CameraRotationInterpolationAlpha(double interpolationAlpha) {
@@ -3181,67 +3068,6 @@ bool ApplyInterpolatedEffectTime(
                    InterpolatedPresentationTime(previousTime, currentTime,
                                                 interpolationAlpha));
     return true;
-}
-
-double LatestNativeTicInterpolationAlphaForMode(
-    std::int64_t nowQpc, std::int64_t currentSnapshotQpc,
-    std::int64_t frequency, bool overdueSnapshotFallback) {
-    if (frequency <= 0) return 1.0;
-    const double elapsedSeconds =
-        static_cast<double>(nowQpc - currentSnapshotQpc) /
-        static_cast<double>(frequency);
-    return std::clamp(elapsedSeconds / kNativeTicSeconds, 0.0,
-                      overdueSnapshotFallback ? 2.0 : 1.0);
-}
-
-double LatestNativeTicInterpolationAlpha(std::int64_t nowQpc,
-                                         std::int64_t currentSnapshotQpc,
-                                         std::int64_t frequency) {
-    return LatestNativeTicInterpolationAlphaForMode(
-        nowQpc, currentSnapshotQpc, frequency,
-        g_overdueSnapshotFallbackRequested);
-}
-
-double PendingNativeTicInterpolationAlpha(std::int64_t nowQpc,
-                                          std::int64_t currentSnapshotQpc,
-                                          std::int64_t frequency) {
-    if (frequency <= 0) return 1.0;
-    const double elapsedSeconds =
-        static_cast<double>(nowQpc - currentSnapshotQpc) /
-        static_cast<double>(frequency);
-    return std::clamp(
-        (elapsedSeconds - kNativeTicSeconds) / kNativeTicSeconds,
-        0.0, 1.0);
-}
-
-double EntityInterpolationAlpha(bool pending, std::uint32_t transitionSamples,
-                                double cameraAlpha, double latestTicAlpha,
-                                double pendingTicAlpha,
-                                bool multiTicEntityAlignment,
-                                bool overdueSnapshotFallback) {
-    if (pending && overdueSnapshotFallback) return pendingTicAlpha;
-    if (transitionSamples > 1 && multiTicEntityAlignment) {
-        return latestTicAlpha;
-    }
-    return cameraAlpha;
-}
-
-double AnimationInterpolationAlpha(bool pending,
-                                   std::uint32_t transitionSamples,
-                                   double cameraAlpha,
-                                   double latestTicAlpha,
-                                   double pendingTicAlpha,
-                                   bool multiTicEntityAlignment,
-                                   bool overdueSnapshotFallback) {
-    // One native tic of prediction is required to bridge the engine's regular
-    // paired-tic catch-ups.  The upstream cadence functions already bound the
-    // value to that horizon; keep a final defensive bound here as well.
-    return std::clamp(
-        EntityInterpolationAlpha(
-            pending, transitionSamples, cameraAlpha, latestTicAlpha,
-            pendingTicAlpha, multiTicEntityAlignment,
-            overdueSnapshotFallback),
-        0.0, 2.0);
 }
 
 std::uint32_t CameraSnapshotDiscontinuityMask(
@@ -3301,13 +3127,9 @@ void InterpolateCameraFov(
 bool BuildInterpolatedView(const void* view,
                            std::array<std::uint8_t, kRenderViewSize>& temporary,
                            double& interpolationAlpha,
-                           double& latestTicAlpha,
-                           double& pendingTicAlpha,
                            double& basePitch,
                            bool& basePitchValid) {
     interpolationAlpha = 1.0;
-    latestTicAlpha = 1.0;
-    pendingTicAlpha = 1.0;
     basePitchValid = ReadEffectivePitch(basePitch);
     if (!g_cameraInterpolationRequested || view == nullptr ||
         g_frequency.QuadPart <= 0) return false;
@@ -3450,18 +3272,11 @@ bool BuildInterpolatedView(const void* view,
             AxisAngleDegrees(g_cameraCurrent.data(), view) >
             kMaximumCameraAngleDegrees;
         const bool clockDebtExceeded =
-            g_continuousSnapshotTimingRequested &&
             g_cameraTimelineSynchronized && !timeDeltaChanged &&
             CameraSnapshotClockDebtExceeded(
                 g_cameraCurrentQpc, static_cast<std::int32_t>(timeDelta),
-                g_overdueSnapshotFallbackRequested
-                    ? kMaximumInterpolatedCameraIntervalMilliseconds
-                    : kNativeTicMilliseconds,
+                kNativeTicMilliseconds,
                 now.QuadPart, g_frequency.QuadPart);
-        const std::int32_t maximumClockDebtMilliseconds =
-            g_overdueSnapshotFallbackRequested
-                ? kMaximumInterpolatedCameraIntervalMilliseconds
-                : kNativeTicMilliseconds;
         const double clockDebtMilliseconds = clockDebtExceeded
             ? 1000.0 * static_cast<double>(
                   now.QuadPart -
@@ -3522,7 +3337,7 @@ bool BuildInterpolatedView(const void* view,
                     "debt_ms=%.4f limit_ms=%d\r\n",
                     static_cast<long long>(now.QuadPart), viewTime,
                     static_cast<long long>(timeDelta), clockDebtMilliseconds,
-                    maximumClockDebtMilliseconds);
+                    kNativeTicMilliseconds);
                 if (length > 0) {
                     LogPresentationEvent(
                         std::string(buffer, static_cast<std::size_t>(length)));
@@ -3538,72 +3353,60 @@ bool BuildInterpolatedView(const void* view,
             g_canInterpolateCamera = true;
             g_cameraCurrentIntervalMilliseconds =
                 static_cast<std::int32_t>(timeDelta);
-            if (g_continuousSnapshotTimingRequested) {
-                if (producedCurrent != nullptr &&
-                    g_cameraTimelineSynchronized) {
-                    // Every producer sample represents one completed native
-                    // tic, including the intermediate sample in a paired-tic
-                    // catch-up. Preserve that logical cadence when production
-                    // is late, but never place an already-produced snapshot in
-                    // the future. The one-sided clamp can only advance the
-                    // presentation phase and cannot cause an alpha rollback.
-                    std::int64_t earlyClampQpc = 0;
-                    g_cameraCurrentQpc = AdvanceProducedCameraSnapshotClock(
+            if (producedCurrent != nullptr &&
+                g_cameraTimelineSynchronized) {
+                // Advance from authoritative native-tic timestamps. The
+                // one-sided clamp never puts an already-produced snapshot in
+                // the future.
+                std::int64_t earlyClampQpc = 0;
+                g_cameraCurrentQpc = AdvanceProducedCameraSnapshotClock(
+                    g_cameraCurrentQpc,
+                    g_cameraCurrentIntervalMilliseconds,
+                    observedSnapshotQpc, g_frequency.QuadPart,
+                    &earlyClampQpc);
+                g_cameraFrameProbe.producerEarlyClampQpc += earlyClampQpc;
+                g_cameraPhaseRecoveryActive = false;
+                g_cameraPhaseRecoveryCandidateQpc = 0;
+            } else if (g_cameraTimelineSynchronized) {
+                const CameraSnapshotClockUpdate clockUpdate =
+                    UpdateCameraSnapshotClock(
                         g_cameraCurrentQpc,
                         g_cameraCurrentIntervalMilliseconds,
-                        observedSnapshotQpc, g_frequency.QuadPart,
-                        &earlyClampQpc);
-                    g_cameraFrameProbe.producerEarlyClampQpc += earlyClampQpc;
-                    g_cameraPhaseRecoveryActive = false;
-                    g_cameraPhaseRecoveryCandidateQpc = 0;
-                } else if (g_cameraTimelineSynchronized) {
-                    const CameraSnapshotClockUpdate clockUpdate =
-                        UpdateCameraSnapshotClock(
-                            g_cameraCurrentQpc,
-                            g_cameraCurrentIntervalMilliseconds,
-                            previousCallQpc, now.QuadPart,
-                            g_frequency.QuadPart,
-                            g_cameraPhaseRecoveryActive,
-                            g_cameraPhaseRecoveryCandidateQpc);
-                    g_cameraCurrentQpc = clockUpdate.qpc;
-                    if (clockUpdate.recoveryStarted ||
-                        clockUpdate.recoveryFinished) {
-                        const double phaseLagMilliseconds =
-                            1000.0 * static_cast<double>(
-                                clockUpdate.phaseLagQpc) /
-                            static_cast<double>(g_frequency.QuadPart);
-                        const double correctionMilliseconds =
-                            1000.0 * static_cast<double>(
-                                clockUpdate.correctionQpc) /
-                            static_cast<double>(g_frequency.QuadPart);
-                        char buffer[288]{};
-                        const int length = _snprintf_s(
-                            buffer, sizeof(buffer), _TRUNCATE,
-                            "camera: presentation timeline phase recovery %s; "
-                            "qpc=%lld view_time=%d view_delta=%lld "
-                            "lag_ms=%.4f correction_ms=%.4f\r\n",
-                            clockUpdate.recoveryStarted ? "started" : "finished",
-                            static_cast<long long>(now.QuadPart), viewTime,
-                            static_cast<long long>(timeDelta),
-                            phaseLagMilliseconds, correctionMilliseconds);
-                        if (length > 0) {
-                            LogPresentationEvent(std::string(
-                                buffer, static_cast<std::size_t>(length)));
-                        }
+                        previousCallQpc, now.QuadPart,
+                        g_frequency.QuadPart,
+                        g_cameraPhaseRecoveryActive,
+                        g_cameraPhaseRecoveryCandidateQpc);
+                g_cameraCurrentQpc = clockUpdate.qpc;
+                if (clockUpdate.recoveryStarted ||
+                    clockUpdate.recoveryFinished) {
+                    const double phaseLagMilliseconds =
+                        1000.0 * static_cast<double>(
+                            clockUpdate.phaseLagQpc) /
+                        static_cast<double>(g_frequency.QuadPart);
+                    const double correctionMilliseconds =
+                        1000.0 * static_cast<double>(
+                            clockUpdate.correctionQpc) /
+                        static_cast<double>(g_frequency.QuadPart);
+                    char buffer[288]{};
+                    const int length = _snprintf_s(
+                        buffer, sizeof(buffer), _TRUNCATE,
+                        "camera: presentation timeline phase recovery %s; "
+                        "qpc=%lld view_time=%d view_delta=%lld "
+                        "lag_ms=%.4f correction_ms=%.4f\r\n",
+                        clockUpdate.recoveryStarted ? "started" : "finished",
+                        static_cast<long long>(now.QuadPart), viewTime,
+                        static_cast<long long>(timeDelta),
+                        phaseLagMilliseconds, correctionMilliseconds);
+                    if (length > 0) {
+                        LogPresentationEvent(std::string(
+                            buffer, static_cast<std::size_t>(length)));
                     }
-                } else {
-                    // Establish a stable phase, then advance it from the
-                    // authoritative simulation timestamps.
-                    g_cameraCurrentQpc = observedSnapshotQpc;
-                    g_cameraTimelineSynchronized = true;
-                    g_cameraPhaseRecoveryActive = false;
-                    g_cameraPhaseRecoveryCandidateQpc = 0;
                 }
             } else {
-                // RC1 compatibility: restart interpolation when this
-                // presentation call observes each new snapshot.
+                // Establish a stable phase, then advance it from the
+                // authoritative simulation timestamps.
                 g_cameraCurrentQpc = observedSnapshotQpc;
-                g_cameraTimelineSynchronized = false;
+                g_cameraTimelineSynchronized = true;
                 g_cameraPhaseRecoveryActive = false;
                 g_cameraPhaseRecoveryCandidateQpc = 0;
             }
@@ -3622,11 +3425,6 @@ bool BuildInterpolatedView(const void* view,
         g_cameraCurrentQpc, g_frequency.QuadPart);
     const double rotationAlpha = CameraRotationInterpolationAlpha(alpha);
     interpolationAlpha = alpha;
-    latestTicAlpha = LatestNativeTicInterpolationAlpha(
-        now.QuadPart, g_cameraCurrentQpc, g_frequency.QuadPart);
-    pendingTicAlpha = PendingNativeTicInterpolationAlpha(
-        now.QuadPart, g_cameraCurrentQpc, g_frequency.QuadPart);
-    if (alpha > 1.0) ++g_viewCounters.extrapolatedViews;
     basePitchValid = g_cameraPreviousPitchValid && g_cameraCurrentPitchValid;
     if (basePitchValid) {
         basePitch = g_cameraPreviousPitch +
@@ -3717,8 +3515,7 @@ void ObserveView(const void* view) {
 void AppendInterpolationTrace(
     const void* sourceView, const void* presentedView,
     bool cameraInterpolated, bool effectsTimeApplied, bool mouseOverlaid,
-    double cameraAlpha, double latestTicAlpha, double pendingTicAlpha,
-    double basePitch,
+    double cameraAlpha, double basePitch,
     std::size_t appliedEntityCount,
     const std::array<AppliedViewEntityPose, kMaximumAppliedEntityPoses>& applied,
     const ViewCounters& beforeEntities) {
@@ -3836,7 +3633,7 @@ void AppendInterpolationTrace(
         "fov_interpolated=%d can_interpolate=%d "
         "camera_applied=%d effects_time_applied=%d mouse_applied=%d "
         "source_time=%d presented_time=%d "
-        "alpha=%.6f latest_alpha=%.6f pending_alpha=%.6f "
+        "alpha=%.6f "
         "source_origin=%.4f,%.4f,%.4f presented_origin=%.4f,%.4f,%.4f "
         "source_forward=%.6f,%.6f,%.6f "
         "presented_forward=%.6f,%.6f,%.6f base_pitch=%.6f "
@@ -3852,11 +3649,7 @@ void AppendInterpolationTrace(
         "roots_current=%zu roots_pending=%zu roots_other=%zu "
         "anims_current=%zu anims_pending=%zu anims_other=%zu "
         "frame_viewmodel_roots=%llu frame_world_roots=%llu "
-        "frame_viewmodel_anims=%llu frame_world_anims=%llu "
-        "frame_viewmodel_latest_roots=%llu frame_world_latest_roots=%llu "
-        "frame_viewmodel_pending_roots=%llu frame_world_pending_roots=%llu "
-        "frame_viewmodel_latest_anims=%llu frame_world_latest_anims=%llu "
-        "frame_viewmodel_pending_anims=%llu frame_world_pending_anims=%llu\r\n",
+        "frame_viewmodel_anims=%llu frame_world_anims=%llu\r\n",
         static_cast<long long>(g_cameraFrameProbe.qpc),
         comTicNumber,
         static_cast<unsigned long long>(selectedGameTic.serial),
@@ -3884,8 +3677,8 @@ void AppendInterpolationTrace(
         g_cameraFrameProbe.fovInterpolated ? 1 : 0,
         g_canInterpolateCamera ? 1 : 0, cameraInterpolated ? 1 : 0,
         effectsTimeApplied ? 1 : 0, mouseOverlaid ? 1 : 0,
-        sourceTime, presentedTime, cameraAlpha, latestTicAlpha,
-        pendingTicAlpha, sourceOrigin[0], sourceOrigin[1], sourceOrigin[2],
+        sourceTime, presentedTime, cameraAlpha,
+        sourceOrigin[0], sourceOrigin[1], sourceOrigin[2],
         presentedOrigin[0], presentedOrigin[1], presentedOrigin[2],
         sourceAxis[0], sourceAxis[1], sourceAxis[2], presentedAxis[0],
         presentedAxis[1], presentedAxis[2], basePitch,
@@ -3917,31 +3710,7 @@ void AppendInterpolationTrace(
             beforeEntities.adjustedViewModelAnimations)),
         static_cast<unsigned long long>(delta(
             g_viewCounters.adjustedWorldAnimations,
-            beforeEntities.adjustedWorldAnimations)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.viewModelLatestTicRoots,
-            beforeEntities.viewModelLatestTicRoots)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.worldLatestTicRoots,
-            beforeEntities.worldLatestTicRoots)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.viewModelPendingRoots,
-            beforeEntities.viewModelPendingRoots)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.worldPendingRoots,
-            beforeEntities.worldPendingRoots)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.viewModelLatestTicAnimations,
-            beforeEntities.viewModelLatestTicAnimations)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.worldLatestTicAnimations,
-            beforeEntities.worldLatestTicAnimations)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.viewModelPendingAnimations,
-            beforeEntities.viewModelPendingAnimations)),
-        static_cast<unsigned long long>(delta(
-            g_viewCounters.worldPendingAnimations,
-            beforeEntities.worldPendingAnimations)));
+            beforeEntities.adjustedWorldAnimations)));
     if (length <= 0) return;
     LogPresentationEvent(
         std::string(line, static_cast<std::size_t>(length)));
@@ -4052,14 +3821,11 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
     ObserveView(view);
     alignas(16) std::array<std::uint8_t, kRenderViewSize> temporary{};
     double interpolationAlpha = 1.0;
-    double latestTicAlpha = 1.0;
-    double pendingTicAlpha = 1.0;
     double basePitch = 0.0;
     bool basePitchValid = false;
     const bool cameraInterpolated =
         BuildInterpolatedView(view, temporary, interpolationAlpha,
-                              latestTicAlpha, pendingTicAlpha, basePitch,
-                              basePitchValid);
+                              basePitch, basePitchValid);
     const bool effectsTimeApplied = cameraInterpolated &&
         ApplyInterpolatedEffectTime(temporary, interpolationAlpha);
     const void* baseView = cameraInterpolated ? temporary.data() : view;
@@ -4073,13 +3839,12 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
     const ViewCounters beforeEntities = g_viewCounters;
     const std::size_t appliedCount =
         ApplyInterpolatedRenderEntities(viewId, interpolationAlpha,
-                                        latestTicAlpha, pendingTicAlpha,
                                         cameraInterpolated, mouseOverlay,
                                         g_appliedEntityPoses);
     AppendInterpolationTrace(
         view, presentedView, cameraInterpolated, effectsTimeApplied,
         mouseOverlaid,
-        interpolationAlpha, latestTicAlpha, pendingTicAlpha, basePitch,
+        interpolationAlpha, basePitch,
         appliedCount,
         g_appliedEntityPoses, beforeEntities);
     g_originalSingleView(self, hud, presentedView);
@@ -5431,16 +5196,7 @@ void ReportFrame() {
                                    "mouse_tic_selections=%llu "
                                    "mouse_direct_selections=%llu "
                                    "mouse_command_misses=%llu "
-                                   "mouse_ledger_overflows=%llu "
-                                   "viewmodel_latest_tic_roots=%llu "
-                                   "viewmodel_latest_tic_anims=%llu "
-                                   "world_latest_tic_roots=%llu "
-                                   "world_latest_tic_anims=%llu "
-                                   "camera_extrapolated=%llu "
-                                   "viewmodel_pending_roots=%llu "
-                                   "viewmodel_pending_anims=%llu "
-                                   "world_pending_roots=%llu "
-                                   "world_pending_anims=%llu "
+                                    "mouse_ledger_overflows=%llu "
                                    "entity_candidates=%zu "
                                    "entity_candidate_max=%llu "
                                    "entity_candidate_rebuilds=%llu "
@@ -5559,26 +5315,8 @@ void ReportFrame() {
                                        mouseDirectSelections),
                                    static_cast<unsigned long long>(
                                        mouseCommandMisses),
-                                   static_cast<unsigned long long>(
-                                       mouseLedgerOverflows),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.viewModelLatestTicRoots),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.viewModelLatestTicAnimations),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.worldLatestTicRoots),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.worldLatestTicAnimations),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.extrapolatedViews),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.viewModelPendingRoots),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.viewModelPendingAnimations),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.worldPendingRoots),
-                                   static_cast<unsigned long long>(
-                                       g_viewCounters.worldPendingAnimations),
+                                    static_cast<unsigned long long>(
+                                        mouseLedgerOverflows),
                                    g_presentationCandidateCount,
                                    static_cast<unsigned long long>(
                                        g_viewCounters.maximumPresentationCandidates),
@@ -5710,14 +5448,6 @@ void ConfigureFromEnvironment() {
     g_mouseInterpolationRequested =
         ReadEnvironmentFlag(L"PREYHFR_MOUSE_INTERP") &&
         g_cameraInterpolationRequested;
-    g_continuousSnapshotTimingRequested =
-        ReadEnvironmentFlag(L"PREYHFR_CONTINUOUS_SNAPSHOT_TIMING");
-    g_multiTicEntityAlignmentRequested =
-        ReadEnvironmentFlag(L"PREYHFR_MULTI_TIC_ENTITY_ALIGNMENT") &&
-        g_continuousSnapshotTimingRequested;
-    g_overdueSnapshotFallbackRequested =
-        ReadEnvironmentFlag(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK") &&
-        g_multiTicEntityAlignmentRequested;
     g_interpolationTraceRequested =
         ReadEnvironmentFlag(L"PREYHFR_INTERPOLATION_TRACE") &&
         g_cameraInterpolationRequested;
@@ -5750,11 +5480,6 @@ void ConfigureFromConfig(const preyhfr::Config& config) {
     g_maximumWorldEntityAngleDegrees = config.maximumWorldEntityAngle;
     g_mouseInterpolationRequested =
         config.mouseInterpolation && config.cameraInterpolation;
-    g_continuousSnapshotTimingRequested = config.continuousSnapshotTiming;
-    g_multiTicEntityAlignmentRequested =
-        config.multiTicEntityAlignment && config.continuousSnapshotTiming;
-    g_overdueSnapshotFallbackRequested =
-        config.overdueSnapshotFallback && g_multiTicEntityAlignmentRequested;
     g_interpolationTraceRequested =
         config.interpolationTrace && config.cameraInterpolation;
     if (g_interpolationTraceRequested) {
@@ -5867,9 +5592,7 @@ bool InstallConfiguredHooks(unsigned int cap) {
                                    "world_interp=%s; world_anim_interp=%s; "
                                    "effect_interp=%s; "
                                    "world_max_distance=%.3f; world_max_angle=%.3f; "
-                                   "mouse_interp=%s; continuous_snapshot_timing=%s; "
-                                   "multi_tic_entity_alignment=%s; "
-                                   "overdue_snapshot_fallback=%s; "
+                                   "mouse_interp=%s; "
                                    "interpolation_trace=%s; "
                                    "timeline_reset_vk=0x%02x; "
                                    "borderless=%s; "
@@ -5890,15 +5613,6 @@ bool InstallConfiguredHooks(unsigned int cap) {
                                    g_maximumWorldEntityStep,
                                    g_maximumWorldEntityAngleDegrees,
                                    g_mouseInterpolationRequested ? "enabled" : "disabled",
-                                   g_continuousSnapshotTimingRequested
-                                       ? "enabled"
-                                       : "disabled",
-                                   g_multiTicEntityAlignmentRequested
-                                       ? "enabled"
-                                       : "disabled",
-                                   g_overdueSnapshotFallbackRequested
-                                       ? "enabled"
-                                       : "disabled",
                                    g_interpolationTraceRequested
                                        ? "enabled"
                                        : "disabled",
@@ -6522,12 +6236,10 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         const auto close = [](double left, double right) {
             return std::abs(left - right) < 0.000001;
         };
-        if (!IsInterpolatableCameraIntervalForMode(
-                kNativeTicMilliseconds, false) ||
-            IsInterpolatableCameraIntervalForMode(
-                kMaximumInterpolatedCameraIntervalMilliseconds, false) ||
-            !IsInterpolatableCameraIntervalForMode(
-                kMaximumInterpolatedCameraIntervalMilliseconds, true) ||
+        if (!IsInterpolatableCameraInterval(kNativeTicMilliseconds) ||
+            !IsInterpolatableCameraInterval(
+                kMaximumInterpolatedCameraIntervalMilliseconds) ||
+            IsInterpolatableCameraInterval(3 * kNativeTicMilliseconds) ||
             !IsConsecutiveProducedCameraBridge(1000, 1016, 1032) ||
             IsConsecutiveProducedCameraBridge(1000, 1032, 1048) ||
             IsConsecutiveProducedCameraBridge(1000, 1016, 1048)) {
@@ -6566,21 +6278,12 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
             3 * kNativeTicMilliseconds, frequency);
         const std::int64_t capturedCheckpointRecovery =
             CameraIntervalQpc(58, frequency);
-        if (!close(CameraInterpolationAlphaForMode(
-                       kNativeTicMilliseconds, twoTics, 0, frequency, false),
+        if (!close(CameraInterpolationAlpha(
+                       kNativeTicMilliseconds, twoTics, 0, frequency),
                    1.0) ||
-            !close(CameraInterpolationAlphaForMode(
-                       kNativeTicMilliseconds, twoTics, 0, frequency, true),
-                   2.0) ||
-            !close(LatestNativeTicInterpolationAlphaForMode(
-                       twoTics, 0, frequency, false),
-                   1.0) ||
-            !close(LatestNativeTicInterpolationAlphaForMode(
-                       twoTics, 0, frequency, true),
-                   2.0) ||
-            !close(CameraInterpolationAlphaForMode(
+            !close(CameraInterpolationAlpha(
                        kMaximumInterpolatedCameraIntervalMilliseconds,
-                       0, 0, frequency, false),
+                       0, 0, frequency),
                    0.5) ||
              !close(CameraRotationInterpolationAlpha(0.75), 0.75) ||
              !close(CameraRotationInterpolationAlpha(1.75), 1.0) ||
@@ -6657,33 +6360,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         if (!jointSpanPassed) {
             return false;
         }
-        constexpr double cameraAlpha = 0.75;
-        constexpr double latestAlpha = 0.5;
-        constexpr double pendingAlpha = 0.25;
-        return close(EntityInterpolationAlpha(
-                         false, 2, cameraAlpha, latestAlpha, pendingAlpha,
-                         false, false),
-                     cameraAlpha) &&
-               close(EntityInterpolationAlpha(
-                         false, 2, cameraAlpha, latestAlpha, pendingAlpha,
-                         true, false),
-                     latestAlpha) &&
-               close(EntityInterpolationAlpha(
-                         true, 1, cameraAlpha, latestAlpha, pendingAlpha,
-                         true, false),
-                     cameraAlpha) &&
-               close(EntityInterpolationAlpha(
-                         true, 1, cameraAlpha, latestAlpha, pendingAlpha,
-                         true, true),
-                     pendingAlpha) &&
-               close(AnimationInterpolationAlpha(
-                         false, 1, 1.75, latestAlpha, pendingAlpha,
-                         true, true),
-                     1.75) &&
-               close(AnimationInterpolationAlpha(
-                         false, 2, cameraAlpha, 1.5, pendingAlpha,
-                         true, true),
-                     1.5);
+        return true;
     };
     const auto testRate = [](double rate, bool requireGap,
                              bool requireAdjacentChanges) {
@@ -6699,9 +6376,6 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         std::int64_t lastCallQpc = 0;
         bool phaseRecoveryActive = false;
         std::int64_t phaseRecoveryCandidateQpc = 0;
-        std::int32_t entityPreviousTime = 0;
-        std::int32_t entityCurrentTime = 0;
-        std::uint32_t entityTransitionSamples = 0;
         double previousPresented = 0.0;
         bool sawGap = false;
         bool sawAdjacentChanges = false;
@@ -6721,8 +6395,6 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
             if (!haveCurrent) {
                 previousTime = viewTime;
                 currentTime = viewTime;
-                entityPreviousTime = viewTime;
-                entityCurrentTime = viewTime;
                 currentQpc = now;
                 haveCurrent = true;
             } else if (viewTime != currentTime) {
@@ -6736,12 +6408,6 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
                     kMaximumInterpolatedCameraIntervalMilliseconds;
                 currentTime = viewTime;
                 currentInterval = delta;
-                entityTransitionSamples = 0;
-                while (entityCurrentTime < viewTime) {
-                    entityPreviousTime = entityCurrentTime;
-                    entityCurrentTime += kNativeTicMilliseconds;
-                    ++entityTransitionSamples;
-                }
                 if (synchronized) {
                     currentQpc = UpdateCameraSnapshotClock(
                         currentQpc, delta, lastCallQpc, now, frequency,
@@ -6760,18 +6426,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
 
             const double alpha = CameraInterpolationAlpha(
                 currentInterval, now, currentQpc, frequency);
-            const double latestAlpha = LatestNativeTicInterpolationAlpha(
-                now, currentQpc, frequency);
             const double presented = static_cast<double>(previousTime) +
                 static_cast<double>(currentTime - previousTime) * alpha;
-            const double entityAlpha = entityTransitionSamples > 1
-                ? latestAlpha
-                : alpha;
-            const double entityPresented =
-                static_cast<double>(entityPreviousTime) +
-                static_cast<double>(entityCurrentTime - entityPreviousTime) *
-                    entityAlpha;
-            if (std::abs(entityPresented - presented) > 0.002) return false;
             // Allow the first snapshot transition to establish the stable
             // presentation phase before checking its increments.
             if (havePresented && frame >= 64) {
@@ -6786,111 +6442,6 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         }
         return (!requireGap || sawGap) &&
                (!requireAdjacentChanges || sawAdjacentChanges);
-    };
-
-    const auto testOverdue360 = [] {
-        constexpr double rate = 360.0;
-        const double frameNanoseconds =
-            static_cast<double>(frequency) / rate;
-        bool haveCurrent = false;
-        bool synchronized = false;
-        bool havePresented = false;
-        bool sawGap = false;
-        bool sawPending = false;
-        std::int32_t previousTime = 0;
-        std::int32_t currentTime = 0;
-        std::int32_t currentInterval = kNativeTicMilliseconds;
-        std::int32_t entityPreviousTime = 0;
-        std::int32_t entityCurrentTime = 0;
-        std::int64_t currentQpc = 0;
-        std::int64_t lastCallQpc = 0;
-        bool phaseRecoveryActive = false;
-        std::int64_t phaseRecoveryCandidateQpc = 0;
-        double previousPresented = 0.0;
-
-        for (std::int64_t frame = 0; frame < 1800; ++frame) {
-            const auto now = static_cast<std::int64_t>(
-                std::llround(static_cast<double>(frame) * frameNanoseconds));
-            const double nowMilliseconds =
-                static_cast<double>(now) * 1000.0 /
-                static_cast<double>(frequency);
-            const auto simulationTime = static_cast<std::int32_t>(
-                std::floor(nowMilliseconds /
-                           static_cast<double>(kNativeTicMilliseconds))) *
-                kNativeTicMilliseconds;
-            while (entityCurrentTime < simulationTime) {
-                entityPreviousTime = entityCurrentTime;
-                entityCurrentTime += kNativeTicMilliseconds;
-            }
-
-            const std::int32_t tick =
-                simulationTime / kNativeTicMilliseconds;
-            const std::int32_t viewTime = tick > 0 && tick % 8 == 1
-                ? simulationTime - kNativeTicMilliseconds
-                : simulationTime;
-            if (!haveCurrent) {
-                previousTime = viewTime;
-                currentTime = viewTime;
-                currentQpc = now;
-                haveCurrent = true;
-            } else if (viewTime != currentTime) {
-                previousTime = currentTime;
-                const std::int32_t delta = viewTime - currentTime;
-                if (!IsInterpolatableCameraInterval(delta)) return false;
-                sawGap = sawGap || delta ==
-                    kMaximumInterpolatedCameraIntervalMilliseconds;
-                currentTime = viewTime;
-                currentInterval = delta;
-                if (synchronized) {
-                    currentQpc = UpdateCameraSnapshotClock(
-                        currentQpc, delta, lastCallQpc, now, frequency,
-                        phaseRecoveryActive,
-                        phaseRecoveryCandidateQpc).qpc;
-                } else {
-                    currentQpc = now;
-                    synchronized = true;
-                    phaseRecoveryActive = false;
-                    phaseRecoveryCandidateQpc = 0;
-                }
-            }
-            lastCallQpc = now;
-            if (!synchronized) continue;
-
-            const double cameraAlpha = CameraInterpolationAlpha(
-                currentInterval, now, currentQpc, frequency);
-            const double latestAlpha = LatestNativeTicInterpolationAlpha(
-                now, currentQpc, frequency);
-            const double pendingAlpha = PendingNativeTicInterpolationAlpha(
-                now, currentQpc, frequency);
-            const double cameraPresented =
-                static_cast<double>(previousTime) +
-                static_cast<double>(currentTime - previousTime) * cameraAlpha;
-            const bool pending = entityCurrentTime > currentTime;
-            sawPending = sawPending || pending;
-            const double entityAlpha = pending
-                ? pendingAlpha
-                : currentInterval > kNativeTicMilliseconds
-                    ? latestAlpha
-                    : cameraAlpha;
-            const double entityPresented =
-                static_cast<double>(entityPreviousTime) +
-                static_cast<double>(entityCurrentTime - entityPreviousTime) *
-                    entityAlpha;
-            if (frame >= 400 &&
-                std::abs(entityPresented - cameraPresented) > 0.002) {
-                return false;
-            }
-            if (havePresented && frame >= 400) {
-                const double expected = 1000.0 / rate;
-                if (std::abs((cameraPresented - previousPresented) - expected) >
-                    0.002) {
-                    return false;
-                }
-            }
-            previousPresented = cameraPresented;
-            havePresented = true;
-        }
-        return sawGap && sawPending;
     };
 
     const auto testBatchedPhaseExcursion = [] {
@@ -7056,9 +6607,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
             currentSnapshotQpc = update.qpc;
             sawCandidate = sawCandidate || phaseRecoveryCandidateQpc != 0;
             sawRecoveryStart = sawRecoveryStart || update.recoveryStarted;
-            const double alpha = CameraInterpolationAlphaForMode(
+            const double alpha = CameraInterpolationAlpha(
                 kNativeTicMilliseconds, nowQpc, currentSnapshotQpc,
-                frequency, true);
+                frequency);
             const double presented = previousViewTime +
                 static_cast<double>(kNativeTicMilliseconds) * alpha;
             if (presented <= lastPresented) return false;
@@ -7082,25 +6633,24 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
     const bool featureGatesPassed = testFeatureGates();
     const bool rate120Passed = testRate(120.0, false, true);
     const bool rate60Passed = testRate(60.0, true, false);
-    const bool overdue360Passed = testOverdue360();
     const bool batchedPhasePassed = testBatchedPhaseExcursion();
     const bool earlyProducerPassed = testEarlyProducerClamp();
     const bool presentationCandidatesPassed =
         testPresentationCandidateSelection();
     const bool sustainedPhasePassed = testSustainedPhaseRecovery();
     if (!featureGatesPassed || !rate120Passed || !rate60Passed ||
-        !overdue360Passed || !batchedPhasePassed ||
+        !batchedPhasePassed ||
         !earlyProducerPassed || !presentationCandidatesPassed ||
         !sustainedPhasePassed) {
         char line[336]{};
         const int length = _snprintf_s(
             line, sizeof(line), _TRUNCATE,
             "test: interpolation cadence failed; features=%d rate120=%d "
-            "rate60=%d overdue360=%d batched_phase=%d early_producer=%d "
+            "rate60=%d batched_phase=%d early_producer=%d "
             "presentation_candidates=%d sustained_phase=%d\r\n",
             featureGatesPassed ? 1 : 0, rate120Passed ? 1 : 0,
-            rate60Passed ? 1 : 0, overdue360Passed ? 1 : 0,
-            batchedPhasePassed ? 1 : 0, earlyProducerPassed ? 1 : 0,
+            rate60Passed ? 1 : 0, batchedPhasePassed ? 1 : 0,
+            earlyProducerPassed ? 1 : 0,
             presentationCandidatesPassed ? 1 : 0,
             sustainedPhasePassed ? 1 : 0);
         if (length > 0) Log(std::string(line, static_cast<std::size_t>(length)));
