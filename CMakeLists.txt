@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PreyHFR VERSION 1.0.6 LANGUAGES CXX)
+project(PreyHFR VERSION 1.0.7 LANGUAGES CXX)
 
 set(PREYHFR_PRERELEASE "")
 if(PREYHFR_PRERELEASE)

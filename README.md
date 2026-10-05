@@ -55,13 +55,22 @@ validation matrix.
 
 ## Current status
 
-Version `1.0.6` replaces whole-file SHA-256 activation gates with fail-closed,
-feature-scoped structural compatibility validation. Differently hashed game
-files may now activate when they preserve the tested x86 PE layout, imports,
-exports, hook ABIs, deprotected timing/control-flow signatures, and referenced
-engine data relationships. The original Steam 1.4 hashes remain the fully
-tested baseline rather than an allowlist. Repeated baseline launches passed the
-new gate without an observed startup or runtime regression.
+Version `1.0.7` simplifies the interpolation pipeline around the stabilized
+native clock, retaining only the previous/current authoritative object and
+joint states. It also corrects vehicle mouse-command retirement so shuttle and
+vehicle look no longer inherits the stock one-tic input delay. Focused retail
+tests passed at 144 Hz and approximately 350 FPS in the shuttle and at 120 Hz
+on foot, with no command misses, ledger overflows, or observed regression.
+
+Release hot paths now avoid trace-only state copies, repeated validation of
+stable engine objects and cvars, unnecessary vehicle-snapshot lookups, and
+locked 64-bit operations for presentation-thread-only mouse telemetry.
+Interpolation tracing and the one-second health log remain available.
+
+The structural compatibility validation introduced in 1.0.6 remains in place.
+Differently hashed game files may activate only when they preserve the tested
+x86 PE layout, imports, exports, hook ABIs, deprotected timing/control-flow
+signatures, and referenced engine data relationships.
 
 The renderer-only particle/material clock added in 1.0.5 remains unchanged.
 Continuous effects such as fire advance on every presented frame while gameplay
@@ -116,7 +125,7 @@ cmake --build build-x86 --target PreyHFRBundlePackage
 ```
 
 `PreyHFRPackage` creates and verifies the plugin-only
-`build-x86/release/PreyHFR-1.0.6-windows-x86.zip`.
+`build-x86/release/PreyHFR-1.0.7-windows-x86.zip`.
 `PreyHFRBundlePackage` creates the separate `-with-loader.zip`, pins and
 checksum-verifies Ultimate ASI Loader v9.7.4, and includes its upstream license
 and provenance. Neither build downloads dependencies.

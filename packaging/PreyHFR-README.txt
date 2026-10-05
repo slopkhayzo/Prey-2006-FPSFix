@@ -1,4 +1,4 @@
-PreyHFR 1.0.6
+PreyHFR 1.0.7
 ===============
 
 PreyHFR is an unofficial 32-bit ASI high-frame-rate fix for the Windows Steam
@@ -8,20 +8,18 @@ rates while keeping gameplay at its original speed.
 No original game files are replaced or modified.
 
 
-WHAT'S NEW IN 1.0.6
+WHAT'S NEW IN 1.0.7
 -------------------
 
-- Replaces whole-file game SHA-256 activation gates with fail-closed structural
-  compatibility validation scoped to the enabled features.
-- Accepts a different file identity only when the expected x86 PE layout,
-  retail imports/exports, hook ABIs, deprotected engine timing/control flow,
-  and referenced data relationships all validate.
-- Expands the timing-path signature and verifies the RunGameTic user-command
-  call/return relationship before mouse interpolation activates.
-- Treats required scheduler-clock and DirectInput hooks as transactional:
-  partial installation is rolled back and the plugin remains inert.
-- Retains the 1.0.5 renderer effects clock and all prior interpolation,
-  async-clock, display, input, and rollback behavior.
+- Simplifies object, joint, and camera presentation around the stabilized
+  native clock and keeps only the previous/current authoritative states.
+- Corrects vehicle mouse-command retirement, removing shuttle/vehicle look
+  judder and the stock one-tic mouse delay without changing on-foot input.
+- Removes or gates trace-only copies, repeated stable-object validation,
+  redundant vehicle-snapshot lookups, and presentation-thread atomic telemetry
+  from normal release hot paths.
+- Retains structural compatibility validation, renderer effects timing,
+  async-clock stabilization, display handling, and rollback behavior.
 
 
 QUICK INSTALL - BUNDLE WITH LOADER

@@ -45,6 +45,7 @@ using DetermineViewAnglesFn = void*(__thiscall*)(void*, void*, const void*, void
 using UsercmdTicCmdFn = void*(__thiscall*)(void*, void*, int);
 using UsercmdInterruptFn = void(__thiscall*)(void*);
 using GetDirectUsercmdFn = void*(__thiscall*)(void*, void*);
+using ControllingVehicleFn = bool(__thiscall*)(const void*);
 using DirectInputCreateAFn = HRESULT(WINAPI*)(HINSTANCE, DWORD, void**, void*);
 using DirectInputCreateDeviceFn = HRESULT(WINAPI*)(void*, REFGUID, void**, void*);
 using DirectInputGetDeviceDataFn = HRESULT(WINAPI*)(void*, DWORD, void*, DWORD*, DWORD);
@@ -92,6 +93,11 @@ constexpr std::size_t kMouseMoveStolenBytes =
     preyhfr::kMouseMoveInstructionSize;
 constexpr std::size_t kRenderViewSize = 140;
 constexpr std::size_t kRenderViewTimeOffset = 80;
+// Retail idActor::vehicleInterface. The interface remains attached to an
+// hhPlayer for its lifetime; ControllingVehicle() reports whether it currently
+// owns a live hhVehicle.
+constexpr std::size_t kPlayerVehicleInterfaceOffset = 0x1188;
+constexpr std::size_t kControllingVehicleVtableSlot = 0x30 / sizeof(void*);
 constexpr std::size_t kRenderEntityAllowViewIdOffset = 56;
 constexpr std::size_t kRenderEntityOriginOffset = 60;
 constexpr std::size_t kRenderEntityAxisOffset = 72;
@@ -286,6 +292,10 @@ UsercmdTicCmdFn g_originalUsercmdTicCmd = nullptr;
 UsercmdInterruptFn g_originalUsercmdInterrupt = nullptr;
 GetDirectUsercmdFn g_originalGetDirectUsercmd = nullptr;
 int g_usercmdHookState = 0;
+const void* g_vehicleStatePlayer = nullptr;
+const void* g_vehicleStateInterface = nullptr;
+ControllingVehicleFn g_controllingVehicle = nullptr;
+bool g_vehicleStateResolutionLogged = false;
 
 struct BorderlessWindowState {
     HWND window = nullptr;
@@ -328,21 +338,26 @@ static_assert(sizeof(MouseObjectData) == 16,
 struct MouseCounters {
     std::atomic<std::uint64_t> authoritativeCalls{0};
     std::atomic<std::uint64_t> authoritativeEvents{0};
-    std::atomic<std::uint64_t> peekCalls{0};
-    std::atomic<std::uint64_t> peekEvents{0};
-    std::atomic<std::uint64_t> overlayViews{0};
-    std::atomic<std::uint64_t> skippedState{0};
-    std::atomic<std::uint64_t> skippedSmoothing{0};
-    std::atomic<std::uint64_t> peekFailures{0};
+    // These fields are produced and drained exclusively by the presentation
+    // thread. Keep them non-atomic so ordinary mouse-look frames do not issue
+    // several locked 64-bit operations on the 32-bit release build.
+    std::uint64_t peekCalls = 0;
+    std::uint64_t peekEvents = 0;
+    std::uint64_t overlayViews = 0;
+    std::uint64_t skippedState = 0;
+    std::uint64_t skippedSmoothing = 0;
+    std::uint64_t peekFailures = 0;
     std::atomic<std::uint64_t> moveCalls{0};
     std::atomic<std::uint64_t> moveChanges{0};
-    std::atomic<std::uint64_t> trackedOverlayViews{0};
-    std::atomic<std::uint64_t> retiredChanges{0};
+    std::uint64_t trackedOverlayViews = 0;
+    std::uint64_t retiredChanges = 0;
     std::atomic<std::uint64_t> asyncCommands{0};
     std::atomic<std::uint64_t> ticSelections{0};
     std::atomic<std::uint64_t> directSelections{0};
     std::atomic<std::uint64_t> commandMisses{0};
     std::atomic<std::uint64_t> ledgerOverflows{0};
+    std::uint64_t vehicleViews = 0;
+    std::uint64_t vehicleAcknowledgmentWaits = 0;
 };
 
 MouseCounters g_mouseCounters{};
@@ -358,10 +373,13 @@ struct MouseFrameProbe {
     std::uint64_t includedSerialBefore = 0;
     std::uint64_t includedSerialAfter = 0;
     std::uint64_t selectedSerial = 0;
+    std::uint64_t vehicleAcknowledgedSerial = 0;
     int peekDeltaX = 0;
     int peekDeltaY = 0;
     bool tracked = false;
     bool peeked = false;
+    bool vehicleView = false;
+    bool vehicleAcknowledgmentValid = false;
 };
 
 MouseFrameProbe g_mouseFrameProbe{};
@@ -390,8 +408,21 @@ bool g_haveMouseViewTime = false;
 std::int32_t g_mouseViewTime = 0;
 double g_mouseTransitionYaw = 0.0;
 double g_mouseTransitionPitch = 0.0;
+std::uint64_t g_mouseVehicleProducedSequence = 0;
+std::int32_t g_mouseVehiclePresentationTime = 0;
+std::uint64_t g_mouseVehicleAcknowledgedSerial = 0;
+bool g_haveMouseVehiclePresentationTime = false;
+bool g_mouseVehicleViewActive = false;
+bool g_mouseVehicleAcknowledgmentValid = false;
+std::int32_t g_mouseVehiclePresentationViewId = 0;
 thread_local bool g_capturingUsercmdMouseSerial = false;
 thread_local std::uint64_t g_capturedUsercmdMouseSerial = 0;
+
+const void* g_smoothCvarObject = nullptr;
+const void* g_sensitivityCvarObject = nullptr;
+const void* g_yawCvarObject = nullptr;
+const void* g_pitchCvarObject = nullptr;
+const void* g_validatedMouseOverlayUsercmd = nullptr;
 
 struct ViewCounters {
     std::uint64_t calls = 0;
@@ -477,6 +508,7 @@ struct CameraProductionProbe {
 };
 
 CameraProductionProbe g_cameraProductionProbe{};
+const void* g_validatedCameraRenderView = nullptr;
 
 struct ProducedCameraSnapshot {
     alignas(16) std::array<std::uint8_t, kRenderViewSize> view{};
@@ -485,6 +517,7 @@ struct ProducedCameraSnapshot {
     std::uint64_t mouseSerial = 0;
     double pitch = 0.0;
     bool pitchValid = false;
+    bool vehicleView = false;
 };
 
 std::array<ProducedCameraSnapshot, kProducedCameraSnapshotQueueSize>
@@ -1169,6 +1202,109 @@ bool ModuleRangeHasCharacteristics(const std::uint8_t* module,
         (section->Characteristics & required) == required;
 }
 
+bool ReadVehicleViewState(const void* player) {
+    if (player == nullptr) return false;
+    if (player != g_vehicleStatePlayer) {
+        g_vehicleStatePlayer = player;
+        g_vehicleStateInterface = nullptr;
+        g_controllingVehicle = nullptr;
+        if (!IsReadableRange(
+                player, kPlayerVehicleInterfaceOffset + sizeof(void*))) {
+            return false;
+        }
+        const void* vehicleInterface = ReadUnaligned<const void*>(
+            player, kPlayerVehicleInterfaceOffset);
+        if (!IsReadableRange(vehicleInterface, sizeof(void*))) return false;
+        void** vtable = ReadUnaligned<void**>(vehicleInterface, 0);
+        if (!IsReadableRange(
+                vtable, (kControllingVehicleVtableSlot + 1) * sizeof(void*))) {
+            return false;
+        }
+        const auto function = reinterpret_cast<ControllingVehicleFn>(
+            vtable[kControllingVehicleVtableSlot]);
+        const auto* gameModule = reinterpret_cast<const std::uint8_t*>(
+            GetModuleHandleW(L"gamex86.dll"));
+        constexpr DWORD executableCode =
+            IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+        if (!ModuleRangeHasCharacteristics(
+                gameModule, reinterpret_cast<const void*>(function), 1,
+                executableCode)) {
+            return false;
+        }
+        g_vehicleStateInterface = vehicleInterface;
+        g_controllingVehicle = function;
+        if (!g_vehicleStateResolutionLogged) {
+            Log("mouse: retail vehicle-state observer resolved at player "
+                "offset 0x1188 and interface slot 0x30\r\n");
+            g_vehicleStateResolutionLogged = true;
+        }
+    }
+    return g_vehicleStateInterface != nullptr &&
+           g_controllingVehicle != nullptr &&
+           g_controllingVehicle(g_vehicleStateInterface);
+}
+
+void UpdateMouseVehicleAcknowledgment(const void* presentationView) {
+    if (!g_mouseInterpolationRequested || presentationView == nullptr) return;
+    const auto viewTime = ReadUnaligned<std::int32_t>(
+        presentationView, kRenderViewTimeOffset);
+    const auto viewId = ReadUnaligned<std::int32_t>(presentationView, 0);
+    if (g_haveMouseVehiclePresentationTime &&
+        g_latestProducedCameraSequence == g_mouseVehicleProducedSequence &&
+        viewTime == g_mouseVehiclePresentationTime &&
+        viewId == g_mouseVehiclePresentationViewId) {
+        return;
+    }
+    const ProducedCameraSnapshot* current = FindProducedCameraSnapshot(
+        g_latestProducedCameraSequence);
+    const bool matches = current != nullptr &&
+        ReadUnaligned<std::int32_t>(current->view.data(),
+                                    kRenderViewTimeOffset) == viewTime &&
+        ReadUnaligned<std::int32_t>(current->view.data(), 0) == viewId;
+    if (!matches) {
+        if (!g_haveMouseVehiclePresentationTime ||
+            viewTime != g_mouseVehiclePresentationTime ||
+            viewId != g_mouseVehiclePresentationViewId) {
+            // A camera sample without its producer metadata must not inherit a
+            // vehicle classification from an older frame.
+            g_mouseVehicleViewActive = false;
+            g_mouseVehicleAcknowledgmentValid = false;
+            g_mouseVehicleAcknowledgedSerial = 0;
+            g_mouseVehicleProducedSequence = 0;
+            g_mouseVehiclePresentationTime = viewTime;
+            g_mouseVehiclePresentationViewId = viewId;
+            g_haveMouseVehiclePresentationTime = true;
+        }
+        return;
+    }
+    if (current->sequence == g_mouseVehicleProducedSequence) return;
+
+    g_mouseVehicleProducedSequence = current->sequence;
+    g_mouseVehiclePresentationTime = viewTime;
+    g_mouseVehiclePresentationViewId = viewId;
+    g_haveMouseVehiclePresentationTime = true;
+    g_mouseVehicleViewActive = current->vehicleView;
+    g_mouseVehicleAcknowledgmentValid = false;
+    g_mouseVehicleAcknowledgedSerial = 0;
+    if (!current->vehicleView) return;
+
+    const ProducedCameraSnapshot* previous =
+        FindProducedCameraSnapshot(current->sequence - 1);
+    if (previous == nullptr || !previous->vehicleView ||
+        ReadUnaligned<std::int32_t>(previous->view.data(), 0) != viewId ||
+        ReadUnaligned<std::int32_t>(previous->view.data(),
+                                    kRenderViewTimeOffset) +
+                kNativeTicMilliseconds !=
+            viewTime) {
+        return;
+    }
+    // hhPlayer builds this camera before hhVehicle consumes the current
+    // command. Its axis therefore acknowledges the command selected for the
+    // preceding produced camera, not current->mouseSerial.
+    g_mouseVehicleAcknowledgedSerial = previous->mouseSerial;
+    g_mouseVehicleAcknowledgmentValid = true;
+}
+
 bool ValidateMouseMoveEntry(const std::uint8_t* module, std::string& error) {
     const auto* target = module + kMouseMoveRva;
     if (!ModuleRangeHasCharacteristics(
@@ -1300,23 +1436,30 @@ bool ValidateDeprotectedRuntime(
     return true;
 }
 
-bool ReadEngineCvarFloat(std::uintptr_t pointerRva, float& value) {
+bool ResolveEngineCvarObject(std::uintptr_t pointerRva,
+                             std::size_t requiredSize,
+                             const void*& cachedObject) {
+    if (cachedObject != nullptr) return true;
     const auto* module = reinterpret_cast<const std::uint8_t*>(
         GetModuleHandleW(nullptr));
     if (module == nullptr) return false;
-    void* object = ReadUnaligned<void*>(module, pointerRva);
-    if (!IsReadableRange(object, 0x2c)) return false;
-    value = ReadUnaligned<float>(object, 0x28);
+    const void* object = ReadUnaligned<const void*>(module, pointerRva);
+    if (!IsReadableRange(object, requiredSize)) return false;
+    cachedObject = object;
+    return true;
+}
+
+bool ReadEngineCvarFloat(std::uintptr_t pointerRva,
+                         const void*& cachedObject, float& value) {
+    if (!ResolveEngineCvarObject(pointerRva, 0x2c, cachedObject)) return false;
+    value = ReadUnaligned<float>(cachedObject, 0x28);
     return std::isfinite(value);
 }
 
-bool ReadEngineCvarInteger(std::uintptr_t pointerRva, int& value) {
-    const auto* module = reinterpret_cast<const std::uint8_t*>(
-        GetModuleHandleW(nullptr));
-    if (module == nullptr) return false;
-    void* object = ReadUnaligned<void*>(module, pointerRva);
-    if (!IsReadableRange(object, 0x28)) return false;
-    value = ReadUnaligned<int>(object, 0x24);
+bool ReadEngineCvarInteger(std::uintptr_t pointerRva,
+                           const void*& cachedObject, int& value) {
+    if (!ResolveEngineCvarObject(pointerRva, 0x28, cachedObject)) return false;
+    value = ReadUnaligned<int>(cachedObject, 0x24);
     return true;
 }
 
@@ -1513,9 +1656,25 @@ bool SumMouseDeltasLocked(std::uint64_t firstSerial,
     return true;
 }
 
+std::uint64_t SelectMouseRetirementSerial(
+    std::uint64_t includedSerial, std::uint64_t selectedSerial,
+    bool vehicleView, std::uint64_t vehicleAcknowledgedSerial,
+    bool vehicleAcknowledgmentValid) {
+    selectedSerial = std::max(selectedSerial, includedSerial);
+    std::uint64_t retirementSerial = selectedSerial;
+    if (vehicleView) {
+        retirementSerial = vehicleAcknowledgmentValid
+            ? vehicleAcknowledgedSerial
+            : includedSerial;
+    }
+    return std::clamp(retirementSerial, includedSerial, selectedSerial);
+}
+
 bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
-                            bool cameraInterpolated, double& yaw,
-                            double& pitch) {
+                            bool cameraInterpolated, bool vehicleView,
+                            std::uint64_t vehicleAcknowledgedSerial,
+                            bool vehicleAcknowledgmentValid,
+                            double& yaw, double& pitch) {
     yaw = 0.0;
     pitch = 0.0;
     if (view == nullptr || g_usercmdHookState != 1) return false;
@@ -1523,15 +1682,30 @@ bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
     const auto viewTime = ReadUnaligned<std::int32_t>(view, 80);
     AcquireSRWLockExclusive(&g_mouseLedgerLock);
     const std::uint64_t latest = g_latestMouseSerial;
-    g_mouseFrameProbe.latestSerial = latest;
-    g_mouseFrameProbe.includedSerialBefore = g_includedMouseSerial;
+    if (g_interpolationTraceRequested) {
+        g_mouseFrameProbe.latestSerial = latest;
+        g_mouseFrameProbe.includedSerialBefore = g_includedMouseSerial;
+        g_mouseFrameProbe.vehicleView = vehicleView;
+        g_mouseFrameProbe.vehicleAcknowledgedSerial =
+            vehicleAcknowledgedSerial;
+        g_mouseFrameProbe.vehicleAcknowledgmentValid =
+            vehicleAcknowledgmentValid;
+    }
+    if (vehicleView) ++g_mouseCounters.vehicleViews;
     bool valid = true;
     if (!g_haveMouseViewTime || viewTime != g_mouseViewTime) {
-        std::uint64_t selected =
+        const std::uint64_t selectedCommand =
             g_selectedMouseSerial.load(std::memory_order_acquire);
-        selected = std::min(selected, latest);
-        selected = std::max(selected, g_includedMouseSerial);
-        g_mouseFrameProbe.selectedSerial = selected;
+        std::uint64_t selected = SelectMouseRetirementSerial(
+            g_includedMouseSerial, std::min(selectedCommand, latest),
+            vehicleView, vehicleAcknowledgedSerial,
+            vehicleAcknowledgmentValid);
+        if (vehicleView && selected < std::min(selectedCommand, latest)) {
+            ++g_mouseCounters.vehicleAcknowledgmentWaits;
+        }
+        if (g_interpolationTraceRequested) {
+            g_mouseFrameProbe.selectedSerial = selected;
+        }
         double incorporatedYaw = 0.0;
         double incorporatedPitch = 0.0;
         if (selected > g_includedMouseSerial) {
@@ -1576,9 +1750,11 @@ bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
         pitch = 0.0;
         ++g_mouseCounters.ledgerOverflows;
     }
-    g_mouseFrameProbe.includedSerialAfter = g_includedMouseSerial;
-    g_mouseFrameProbe.transitionYaw = g_mouseTransitionYaw;
-    g_mouseFrameProbe.transitionPitch = g_mouseTransitionPitch;
+    if (g_interpolationTraceRequested) {
+        g_mouseFrameProbe.includedSerialAfter = g_includedMouseSerial;
+        g_mouseFrameProbe.transitionYaw = g_mouseTransitionYaw;
+        g_mouseFrameProbe.transitionPitch = g_mouseTransitionPitch;
+    }
     ReleaseSRWLockExclusive(&g_mouseLedgerLock);
     return valid && (yaw != 0.0 || pitch != 0.0);
 }
@@ -1740,38 +1916,47 @@ bool ApplyPendingMouseOverlay(const void* baseView,
                               double basePitch,
                               bool basePitchValid,
                               MouseOverlay& overlay) {
-    g_mouseFrameProbe = {};
+    if (g_interpolationTraceRequested) g_mouseFrameProbe = {};
     if (!g_mouseInterpolationRequested || baseView == nullptr) return false;
 
     double trackedYaw = 0.0;
     double trackedPitch = 0.0;
     const bool tracked = GetTrackedMouseOverlay(
-        authoritativeView, interpolationAlpha, temporaryInitialized, trackedYaw,
-        trackedPitch);
-    g_mouseFrameProbe.tracked = tracked;
-    g_mouseFrameProbe.trackedYaw = trackedYaw;
-    g_mouseFrameProbe.trackedPitch = trackedPitch;
+        authoritativeView, interpolationAlpha, temporaryInitialized,
+        g_mouseVehicleViewActive, g_mouseVehicleAcknowledgedSerial,
+        g_mouseVehicleAcknowledgmentValid, trackedYaw, trackedPitch);
+    if (g_interpolationTraceRequested) {
+        g_mouseFrameProbe.tracked = tracked;
+        g_mouseFrameProbe.trackedYaw = trackedYaw;
+        g_mouseFrameProbe.trackedPitch = trackedPitch;
+    }
     double yaw = trackedYaw;
     double pitch = trackedPitch;
 
     int deltaX = 0;
     int deltaY = 0;
     const bool peeked = PeekPendingMouse(deltaX, deltaY);
-    g_mouseFrameProbe.peeked = peeked;
-    g_mouseFrameProbe.peekDeltaX = deltaX;
-    g_mouseFrameProbe.peekDeltaY = deltaY;
+    if (g_interpolationTraceRequested) {
+        g_mouseFrameProbe.peeked = peeked;
+        g_mouseFrameProbe.peekDeltaX = deltaX;
+        g_mouseFrameProbe.peekDeltaY = deltaY;
+    }
 
     void* usercmd = g_usercmdGenerator.load(std::memory_order_acquire);
     if (peeked) {
-        if (!IsReadableRange(usercmd, 0xaf4) ||
+        if (usercmd == nullptr ||
+            (usercmd != g_validatedMouseOverlayUsercmd &&
+             !IsReadableRange(usercmd, 0xaf4)) ||
             ReadUnaligned<int>(usercmd, 0x294) != 0 ||
             ReadUnaligned<int>(usercmd, 0x54) > 0 ||
             std::abs(static_cast<double>(deltaX)) > 1000.0 ||
             std::abs(static_cast<double>(deltaY)) > 1000.0) {
             ++g_mouseCounters.skippedState;
         } else {
+            g_validatedMouseOverlayUsercmd = usercmd;
             int smoothing = 0;
-            if (!ReadEngineCvarInteger(kSmoothCvarPointerRva, smoothing) ||
+            if (!ReadEngineCvarInteger(kSmoothCvarPointerRva,
+                                       g_smoothCvarObject, smoothing) ||
                 smoothing != 1) {
                 ++g_mouseCounters.skippedSmoothing;
             } else {
@@ -1782,9 +1967,12 @@ bool ApplyPendingMouseOverlay(const void* baseView,
                     ReadUnaligned<float>(usercmd, 0xaf0);
                 if (!std::isfinite(gameSensitivity) ||
                     !ReadEngineCvarFloat(kSensitivityCvarPointerRva,
+                                         g_sensitivityCvarObject,
                                          sensitivity) ||
-                    !ReadEngineCvarFloat(kYawCvarPointerRva, yawScale) ||
-                    !ReadEngineCvarFloat(kPitchCvarPointerRva, pitchScale)) {
+                    !ReadEngineCvarFloat(kYawCvarPointerRva,
+                                         g_yawCvarObject, yawScale) ||
+                    !ReadEngineCvarFloat(kPitchCvarPointerRva,
+                                         g_pitchCvarObject, pitchScale)) {
                     ++g_mouseCounters.skippedState;
                 } else {
                     yaw += -static_cast<double>(yawScale) * sensitivity *
@@ -1805,8 +1993,10 @@ bool ApplyPendingMouseOverlay(const void* baseView,
         ++g_mouseCounters.skippedState;
         return false;
     }
-    g_mouseFrameProbe.totalYaw = yaw;
-    g_mouseFrameProbe.totalPitch = pitch;
+    if (g_interpolationTraceRequested) {
+        g_mouseFrameProbe.totalYaw = yaw;
+        g_mouseFrameProbe.totalPitch = pitch;
+    }
     if (yaw == 0.0 && pitch == 0.0) return false;
 
     if (!basePitchValid) {
@@ -1975,6 +2165,12 @@ void ResetPresentationTimelineManually() {
     g_haveMouseViewTime = false;
     g_mouseTransitionYaw = 0.0;
     g_mouseTransitionPitch = 0.0;
+    g_mouseVehicleProducedSequence = 0;
+    g_haveMouseVehiclePresentationTime = false;
+    g_mouseVehicleViewActive = false;
+    g_mouseVehicleAcknowledgmentValid = false;
+    g_mouseVehicleAcknowledgedSerial = 0;
+    g_mouseVehiclePresentationViewId = 0;
     ResetTrackedEntityInterpolation();
 
     LARGE_INTEGER now{};
@@ -3512,13 +3708,20 @@ void ObserveView(const void* view) {
     g_havePreviousView = true;
 }
 
+struct InterpolationTraceCounterSnapshot {
+    std::uint64_t adjustedViewModels = 0;
+    std::uint64_t adjustedWorldEntities = 0;
+    std::uint64_t adjustedViewModelAnimations = 0;
+    std::uint64_t adjustedWorldAnimations = 0;
+};
+
 void AppendInterpolationTrace(
     const void* sourceView, const void* presentedView,
     bool cameraInterpolated, bool effectsTimeApplied, bool mouseOverlaid,
     double cameraAlpha, double basePitch,
     std::size_t appliedEntityCount,
     const std::array<AppliedViewEntityPose, kMaximumAppliedEntityPoses>& applied,
-    const ViewCounters& beforeEntities) {
+    const InterpolationTraceCounterSnapshot& beforeEntities) {
     if (!g_interpolationTraceRequested || sourceView == nullptr ||
         presentedView == nullptr || g_frequency.QuadPart <= 0) {
         return;
@@ -3643,6 +3846,8 @@ void AppendInterpolationTrace(
         "mouse_peek=%d mouse_dx=%d mouse_dy=%d "
         "mouse_serial_latest=%llu mouse_serial_included_before=%llu "
         "mouse_serial_included_after=%llu mouse_serial_selected=%llu "
+        "mouse_vehicle_view=%d mouse_vehicle_ack_valid=%d "
+        "mouse_vehicle_ack_serial=%llu "
         "viewmodel_handle=%d viewmodel_source_origin=%.4f,%.4f,%.4f "
         "viewmodel_presented_origin=%.4f,%.4f,%.4f "
         "applied_entities=%zu active_entities=%zu "
@@ -3693,6 +3898,10 @@ void AppendInterpolationTrace(
         static_cast<unsigned long long>(
             g_mouseFrameProbe.includedSerialAfter),
         static_cast<unsigned long long>(g_mouseFrameProbe.selectedSerial),
+        g_mouseFrameProbe.vehicleView ? 1 : 0,
+        g_mouseFrameProbe.vehicleAcknowledgmentValid ? 1 : 0,
+        static_cast<unsigned long long>(
+            g_mouseFrameProbe.vehicleAcknowledgedSerial),
         viewModelHandle, viewModelSourceOrigin[0], viewModelSourceOrigin[1],
         viewModelSourceOrigin[2], viewModelPresentedOrigin[0],
         viewModelPresentedOrigin[1], viewModelPresentedOrigin[2],
@@ -3716,15 +3925,18 @@ void AppendInterpolationTrace(
         std::string(line, static_cast<std::size_t>(length)));
 }
 
-void AppendCameraProductionTrace(const void* renderView,
+void AppendCameraProductionTrace(const void* renderView, bool vehicleView,
                                  std::int64_t beginQpc,
                                  std::int64_t endQpc) {
-    const bool readable = IsReadableRange(renderView, kRenderViewSize);
+    const bool readable = renderView != nullptr &&
+        (renderView == g_validatedCameraRenderView ||
+         IsReadableRange(renderView, kRenderViewSize));
     std::int32_t viewId = 0;
     std::array<float, 3> origin{};
     std::uint64_t producedMouseSerial = 0;
     std::int32_t viewTime = 0;
     if (readable) {
+        g_validatedCameraRenderView = renderView;
         const std::uint64_t producedSequence =
             g_latestProducedCameraSequence + 1;
         auto& produced = g_producedCameraSnapshots[
@@ -3737,6 +3949,7 @@ void AppendCameraProductionTrace(const void* renderView,
             g_selectedMouseSerial.load(std::memory_order_acquire);
         producedMouseSerial = produced.mouseSerial;
         produced.pitchValid = ReadEffectivePitch(produced.pitch);
+        produced.vehicleView = vehicleView;
         g_latestProducedCameraSequence = producedSequence;
 
         viewTime = ReadUnaligned<std::int32_t>(renderView, 80);
@@ -3776,7 +3989,7 @@ void AppendCameraProductionTrace(const void* renderView,
     const int length = _snprintf_s(
         line, sizeof(line), _TRUNCATE,
         "camera_source: qpc=%lld begin_qpc=%lld duration_us=%.3f "
-        "producer_sequence=%llu mouse_serial=%llu "
+        "producer_sequence=%llu mouse_serial=%llu vehicle_view=%d "
         "selected_tic_serial=%llu selected_tic_qpc=%lld "
         "selected_tic_age_ms=%.4f selected_tic_argument=%d "
         "selected_tic_com_tic=%d com_tic=%d readable=%d view_id=%d "
@@ -3785,6 +3998,7 @@ void AppendCameraProductionTrace(const void* renderView,
         durationMicroseconds,
         static_cast<unsigned long long>(g_latestProducedCameraSequence),
         static_cast<unsigned long long>(producedMouseSerial),
+        vehicleView ? 1 : 0,
         static_cast<unsigned long long>(selected.serial),
         static_cast<long long>(selected.qpc), selectedAgeMilliseconds,
         selected.argument, selected.comTic, g_cameraProductionProbe.comTic,
@@ -3803,14 +4017,17 @@ void __fastcall HookedCalculateRenderView(void* self, void*) {
         QueryPerformanceCounter(&begin);
     }
     g_originalCalculateRenderView(self);
+    const bool vehicleView = g_mouseInterpolationRequested &&
+        ReadVehicleViewState(self);
     LARGE_INTEGER end{};
     QueryPerformanceCounter(&end);
 
-    const void* renderView = nullptr;
-    if (IsReadableRange(self, 0xa8)) {
-        renderView = ReadUnaligned<const void*>(self, 0xa4);
-    }
-    AppendCameraProductionTrace(renderView, begin.QuadPart, end.QuadPart);
+    // The validated retail hook has just returned from using this player
+    // object, so repeating a VirtualQuery for the same object every native tic
+    // provides no additional lifetime guarantee.
+    const void* renderView = ReadUnaligned<const void*>(self, 0xa4);
+    AppendCameraProductionTrace(renderView, vehicleView,
+                                begin.QuadPart, end.QuadPart);
 }
 
 void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view) {
@@ -3819,6 +4036,7 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
         expectedThread, GetCurrentThreadId(), std::memory_order_release,
         std::memory_order_relaxed);
     ObserveView(view);
+    UpdateMouseVehicleAcknowledgment(view);
     alignas(16) std::array<std::uint8_t, kRenderViewSize> temporary{};
     double interpolationAlpha = 1.0;
     double basePitch = 0.0;
@@ -3836,17 +4054,27 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
     const void* presentedView =
         (cameraInterpolated || mouseOverlaid) ? temporary.data() : view;
     const int viewId = view != nullptr ? ReadUnaligned<int>(view, 0) : 0;
-    const ViewCounters beforeEntities = g_viewCounters;
+    InterpolationTraceCounterSnapshot beforeEntities;
+    if (g_interpolationTraceRequested) {
+        beforeEntities.adjustedViewModels =
+            g_viewCounters.adjustedViewModels;
+        beforeEntities.adjustedWorldEntities =
+            g_viewCounters.adjustedWorldEntities;
+        beforeEntities.adjustedViewModelAnimations =
+            g_viewCounters.adjustedViewModelAnimations;
+        beforeEntities.adjustedWorldAnimations =
+            g_viewCounters.adjustedWorldAnimations;
+    }
     const std::size_t appliedCount =
         ApplyInterpolatedRenderEntities(viewId, interpolationAlpha,
                                         cameraInterpolated, mouseOverlay,
                                         g_appliedEntityPoses);
-    AppendInterpolationTrace(
-        view, presentedView, cameraInterpolated, effectsTimeApplied,
-        mouseOverlaid,
-        interpolationAlpha, basePitch,
-        appliedCount,
-        g_appliedEntityPoses, beforeEntities);
+    if (g_interpolationTraceRequested) {
+        AppendInterpolationTrace(
+            view, presentedView, cameraInterpolated, effectsTimeApplied,
+            mouseOverlaid, interpolationAlpha, basePitch, appliedCount,
+            g_appliedEntityPoses, beforeEntities);
+    }
     g_originalSingleView(self, hud, presentedView);
     RestoreRenderEntities(g_appliedEntityPoses, appliedCount);
 }
@@ -3866,7 +4094,7 @@ void* __fastcall HookedDetermineViewAngles(void* self, void*, void* output,
     void* result = g_originalDetermineViewAngles(self, output, command,
                                                   commandAngles);
     const void* angles = result != nullptr ? result : output;
-    if (IsReadableRange(angles, 3 * sizeof(float))) {
+    if (angles != nullptr) {
         PublishEffectivePitch(ReadUnaligned<float>(angles, 0));
     }
     return result;
@@ -4095,7 +4323,7 @@ bool IsRunGameTicCaller(const void* returnAddress) {
 }
 
 void RecordSelectedUsercmd(const void* command) {
-    if (!IsReadableRange(command, 32)) return;
+    if (command == nullptr) return;
     const auto sequence = ReadUnaligned<std::int32_t>(command, 28);
     bool found = false;
     bool shouldCountMiss = false;
@@ -4136,7 +4364,6 @@ void __fastcall HookedUsercmdInterrupt(void* self, void*) {
     g_capturingUsercmdMouseSerial = true;
     g_originalUsercmdInterrupt(self);
     g_capturingUsercmdMouseSerial = false;
-    if (!IsReadableRange(self, 0x2c0)) return;
     const auto sequence = ReadUnaligned<std::int32_t>(self, 0x2bc);
     AcquireSRWLockExclusive(&g_mouseLedgerLock);
     if (!g_haveTaggedAsyncCommand) {
@@ -4224,36 +4451,31 @@ void TryInstallUsercmdHooks() {
 
 void __fastcall HookedMouseMove(void* self, void*) {
     g_usercmdGenerator.store(self, std::memory_order_release);
-    float previousPitch = 0.0f;
-    float previousYaw = 0.0f;
-    const bool readable = IsReadableRange(self, 12);
-    if (readable) {
-        previousPitch = ReadUnaligned<float>(self, 4);
-        previousYaw = ReadUnaligned<float>(self, 8);
-    }
+    // The original method necessarily dereferences this validated generator;
+    // avoid querying the same live object before every native mouse update.
+    const float previousPitch = ReadUnaligned<float>(self, 4);
+    const float previousYaw = ReadUnaligned<float>(self, 8);
     g_originalMouseMove(self);
     ++g_mouseCounters.moveCalls;
-    if (readable) {
-        const float currentPitch = ReadUnaligned<float>(self, 4);
-        const float currentYaw = ReadUnaligned<float>(self, 8);
-        const double pitch = static_cast<double>(currentPitch) - previousPitch;
-        const double yaw = static_cast<double>(currentYaw) - previousYaw;
-        if (std::isfinite(yaw) && std::isfinite(pitch) &&
-            (yaw != 0.0 || pitch != 0.0)) {
-            AcquireSRWLockExclusive(&g_mouseLedgerLock);
-            const std::uint64_t serial = ++g_latestMouseSerial;
-            if (serial - g_includedMouseSerial > kMaximumTrackedMouseDeltas) {
-                g_includedMouseSerial = serial;
-                g_mouseTransitionYaw = 0.0;
-                g_mouseTransitionPitch = 0.0;
-                ++g_mouseCounters.ledgerOverflows;
-            }
-            g_mouseDeltaLedger[
-                static_cast<std::size_t>(serial % kMaximumTrackedMouseDeltas)] =
-                {serial, yaw, pitch};
-            ReleaseSRWLockExclusive(&g_mouseLedgerLock);
-            ++g_mouseCounters.moveChanges;
+    const float currentPitch = ReadUnaligned<float>(self, 4);
+    const float currentYaw = ReadUnaligned<float>(self, 8);
+    const double pitch = static_cast<double>(currentPitch) - previousPitch;
+    const double yaw = static_cast<double>(currentYaw) - previousYaw;
+    if (std::isfinite(yaw) && std::isfinite(pitch) &&
+        (yaw != 0.0 || pitch != 0.0)) {
+        AcquireSRWLockExclusive(&g_mouseLedgerLock);
+        const std::uint64_t serial = ++g_latestMouseSerial;
+        if (serial - g_includedMouseSerial > kMaximumTrackedMouseDeltas) {
+            g_includedMouseSerial = serial;
+            g_mouseTransitionYaw = 0.0;
+            g_mouseTransitionPitch = 0.0;
+            ++g_mouseCounters.ledgerOverflows;
         }
+        g_mouseDeltaLedger[
+            static_cast<std::size_t>(serial % kMaximumTrackedMouseDeltas)] =
+            {serial, yaw, pitch};
+        ReleaseSRWLockExclusive(&g_mouseLedgerLock);
+        ++g_mouseCounters.moveChanges;
     }
     if (g_capturingUsercmdMouseSerial) {
         AcquireSRWLockShared(&g_mouseLedgerLock);
@@ -5130,19 +5352,17 @@ void ReportFrame() {
         g_mouseCounters.authoritativeCalls.exchange(0);
     const auto authoritativeMouseEvents =
         g_mouseCounters.authoritativeEvents.exchange(0);
-    const auto mousePeekCalls = g_mouseCounters.peekCalls.exchange(0);
-    const auto mousePeekEvents = g_mouseCounters.peekEvents.exchange(0);
-    const auto mouseOverlayViews = g_mouseCounters.overlayViews.exchange(0);
-    const auto mouseSkippedState = g_mouseCounters.skippedState.exchange(0);
-    const auto mouseSkippedSmoothing =
-        g_mouseCounters.skippedSmoothing.exchange(0);
-    const auto mousePeekFailures = g_mouseCounters.peekFailures.exchange(0);
+    const auto mousePeekCalls = g_mouseCounters.peekCalls;
+    const auto mousePeekEvents = g_mouseCounters.peekEvents;
+    const auto mouseOverlayViews = g_mouseCounters.overlayViews;
+    const auto mouseSkippedState = g_mouseCounters.skippedState;
+    const auto mouseSkippedSmoothing = g_mouseCounters.skippedSmoothing;
+    const auto mousePeekFailures = g_mouseCounters.peekFailures;
     const auto mouseMoveCalls = g_mouseCounters.moveCalls.exchange(0);
     const auto mouseMoveChanges = g_mouseCounters.moveChanges.exchange(0);
     const auto mouseTrackedOverlayViews =
-        g_mouseCounters.trackedOverlayViews.exchange(0);
-    const auto mouseRetiredChanges =
-        g_mouseCounters.retiredChanges.exchange(0);
+        g_mouseCounters.trackedOverlayViews;
+    const auto mouseRetiredChanges = g_mouseCounters.retiredChanges;
     const auto mouseAsyncCommands =
         g_mouseCounters.asyncCommands.exchange(0);
     const auto mouseTicSelections =
@@ -5153,6 +5373,19 @@ void ReportFrame() {
         g_mouseCounters.commandMisses.exchange(0);
     const auto mouseLedgerOverflows =
         g_mouseCounters.ledgerOverflows.exchange(0);
+    const auto mouseVehicleViews = g_mouseCounters.vehicleViews;
+    const auto mouseVehicleAcknowledgmentWaits =
+        g_mouseCounters.vehicleAcknowledgmentWaits;
+    g_mouseCounters.peekCalls = 0;
+    g_mouseCounters.peekEvents = 0;
+    g_mouseCounters.overlayViews = 0;
+    g_mouseCounters.skippedState = 0;
+    g_mouseCounters.skippedSmoothing = 0;
+    g_mouseCounters.peekFailures = 0;
+    g_mouseCounters.trackedOverlayViews = 0;
+    g_mouseCounters.retiredChanges = 0;
+    g_mouseCounters.vehicleViews = 0;
+    g_mouseCounters.vehicleAcknowledgmentWaits = 0;
     char buffer[3600]{};
     const int length = _snprintf_s(buffer, sizeof(buffer), _TRUNCATE,
                                    "presentation: qpc_start=%lld qpc_end=%lld swaps=%llu "
@@ -5196,7 +5429,9 @@ void ReportFrame() {
                                    "mouse_tic_selections=%llu "
                                    "mouse_direct_selections=%llu "
                                    "mouse_command_misses=%llu "
-                                    "mouse_ledger_overflows=%llu "
+                                   "mouse_ledger_overflows=%llu "
+                                   "mouse_vehicle_views=%llu "
+                                   "mouse_vehicle_ack_waits=%llu "
                                    "entity_candidates=%zu "
                                    "entity_candidate_max=%llu "
                                    "entity_candidate_rebuilds=%llu "
@@ -5315,8 +5550,12 @@ void ReportFrame() {
                                        mouseDirectSelections),
                                    static_cast<unsigned long long>(
                                        mouseCommandMisses),
-                                    static_cast<unsigned long long>(
-                                        mouseLedgerOverflows),
+                                   static_cast<unsigned long long>(
+                                       mouseLedgerOverflows),
+                                   static_cast<unsigned long long>(
+                                       mouseVehicleViews),
+                                   static_cast<unsigned long long>(
+                                       mouseVehicleAcknowledgmentWaits),
                                    g_presentationCandidateCount,
                                    static_cast<unsigned long long>(
                                        g_viewCounters.maximumPresentationCandidates),
@@ -6243,6 +6482,18 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
             !IsConsecutiveProducedCameraBridge(1000, 1016, 1032) ||
             IsConsecutiveProducedCameraBridge(1000, 1032, 1048) ||
             IsConsecutiveProducedCameraBridge(1000, 1016, 1048)) {
+            return false;
+        }
+        // Ordinary views retire the currently selected command exactly as
+        // before. Vehicle views retire only the serial acknowledged by the
+        // preceding ship-camera snapshot and never move either boundary
+        // backward or beyond the selected command.
+        if (SelectMouseRetirementSerial(40, 45, false, 0, false) != 45 ||
+            SelectMouseRetirementSerial(40, 45, true, 43, true) != 43 ||
+            SelectMouseRetirementSerial(40, 45, true, 0, false) != 40 ||
+            SelectMouseRetirementSerial(40, 45, true, 35, true) != 40 ||
+            SelectMouseRetirementSerial(40, 45, true, 50, true) != 45 ||
+            SelectMouseRetirementSerial(46, 45, false, 0, false) != 46) {
             return false;
         }
         std::array<std::uint8_t, kRenderViewSize> previousView{};
