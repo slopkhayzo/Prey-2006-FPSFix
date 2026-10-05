@@ -442,6 +442,8 @@ struct ViewCounters {
     std::uint64_t presentationCandidateSourceScans = 0;
     std::uint64_t presentationCandidateVisits = 0;
     std::uint64_t maximumPresentationCandidates = 0;
+    std::uint64_t preparedJointInterpolationSpans = 0;
+    std::uint64_t sphericalJointInterpolationSpans = 0;
     double maximumOriginStep = 0.0;
 };
 
@@ -540,6 +542,20 @@ struct Quaternion {
     double z = 0.0;
 };
 
+struct QuaternionInterpolation {
+    Quaternion from{};
+    Quaternion to{};
+    double theta = 0.0;
+    double inverseSinTheta = 0.0;
+    bool spherical = false;
+};
+
+struct JointInterpolationSpan {
+    QuaternionInterpolation rotation{};
+    std::array<float, 3> translation{};
+    std::array<float, 3> translationDelta{};
+};
+
 struct TrackedJointAnimation {
     bool hasCurrent = false;
     bool canInterpolate = false;
@@ -550,8 +566,7 @@ struct TrackedJointAnimation {
     std::vector<JointMatrix> previous;
     std::vector<JointMatrix> current;
     std::vector<JointMatrix> interpolated;
-    std::vector<Quaternion> previousRotations;
-    std::vector<Quaternion> currentRotations;
+    std::vector<JointInterpolationSpan> interpolationSpans;
 };
 
 struct RenderEntityIdentity {
@@ -1400,7 +1415,8 @@ Quaternion MatrixToQuaternion(const std::array<float, 9>& matrix) {
     return Normalize(result);
 }
 
-Quaternion Slerp(Quaternion from, Quaternion to, double alpha) {
+QuaternionInterpolation PrepareQuaternionInterpolation(Quaternion from,
+                                                       Quaternion to) {
     double dot = QuaternionDot(from, to);
     if (dot < 0.0) {
         to.w = -to.w;
@@ -1410,20 +1426,48 @@ Quaternion Slerp(Quaternion from, Quaternion to, double alpha) {
         dot = -dot;
     }
     dot = std::clamp(dot, 0.0, 1.0);
-    if (dot > 0.9995) {
-        return Normalize({from.w + (to.w - from.w) * alpha,
-                          from.x + (to.x - from.x) * alpha,
-                          from.y + (to.y - from.y) * alpha,
-                          from.z + (to.z - from.z) * alpha});
+    QuaternionInterpolation interpolation;
+    interpolation.from = from;
+    interpolation.to = to;
+    if (dot <= 0.9995) {
+        interpolation.theta = std::acos(dot);
+        interpolation.inverseSinTheta =
+            1.0 / std::sin(interpolation.theta);
+        interpolation.spherical = true;
     }
-    const double theta = std::acos(dot);
-    const double denominator = std::sin(theta);
-    const double fromScale = std::sin((1.0 - alpha) * theta) / denominator;
-    const double toScale = std::sin(alpha * theta) / denominator;
-    return Normalize({from.w * fromScale + to.w * toScale,
-                      from.x * fromScale + to.x * toScale,
-                      from.y * fromScale + to.y * toScale,
-                      from.z * fromScale + to.z * toScale});
+    return interpolation;
+}
+
+Quaternion InterpolateQuaternion(
+    const QuaternionInterpolation& interpolation, double alpha) {
+    if (!interpolation.spherical) {
+        return Normalize({
+            interpolation.from.w +
+                (interpolation.to.w - interpolation.from.w) * alpha,
+            interpolation.from.x +
+                (interpolation.to.x - interpolation.from.x) * alpha,
+            interpolation.from.y +
+                (interpolation.to.y - interpolation.from.y) * alpha,
+            interpolation.from.z +
+                (interpolation.to.z - interpolation.from.z) * alpha,
+        });
+    }
+    const double fromScale =
+        std::sin((1.0 - alpha) * interpolation.theta) *
+        interpolation.inverseSinTheta;
+    const double toScale = std::sin(alpha * interpolation.theta) *
+        interpolation.inverseSinTheta;
+    return Normalize({
+        interpolation.from.w * fromScale + interpolation.to.w * toScale,
+        interpolation.from.x * fromScale + interpolation.to.x * toScale,
+        interpolation.from.y * fromScale + interpolation.to.y * toScale,
+        interpolation.from.z * fromScale + interpolation.to.z * toScale,
+    });
+}
+
+Quaternion Slerp(Quaternion from, Quaternion to, double alpha) {
+    return InterpolateQuaternion(
+        PrepareQuaternionInterpolation(from, to), alpha);
 }
 
 std::array<float, 9> QuaternionToMatrix(const Quaternion& value) {
@@ -1874,6 +1918,10 @@ TrackedRenderEntity* FindTrackedRenderEntity(int handle) {
     return entity.handle == handle ? &entity : nullptr;
 }
 
+void SnapJointInterpolationSpans(
+    const JointMatrix* joints, std::size_t count,
+    std::vector<JointInterpolationSpan>& spans);
+
 void ForgetRenderEntity(int handle) {
     auto* entity = FindTrackedRenderEntity(handle);
     if (entity == nullptr) return;
@@ -1906,8 +1954,10 @@ void ResetTrackedEntityInterpolation() {
         entity->transitionSamples = 0;
         if (entity->animation.hasCurrent) {
             entity->animation.previous = entity->animation.current;
-            entity->animation.previousRotations =
-                entity->animation.currentRotations;
+            SnapJointInterpolationSpans(
+                entity->animation.current.data(),
+                entity->animation.current.size(),
+                entity->animation.interpolationSpans);
             entity->animation.canInterpolate = false;
             entity->animation.transitionSamples = 0;
         }
@@ -2061,11 +2111,52 @@ Quaternion JointMatrixRotation(const JointMatrix& joint) {
     });
 }
 
-void CaptureJointRotations(const JointMatrix* joints, std::size_t count,
-                           std::vector<Quaternion>& rotations) {
-    rotations.resize(count);
+void SnapJointInterpolationSpans(
+    const JointMatrix* joints, std::size_t count,
+    std::vector<JointInterpolationSpan>& spans) {
+    spans.resize(count);
     for (std::size_t index = 0; index < count; ++index) {
-        rotations[index] = JointMatrixRotation(joints[index]);
+        const Quaternion rotation = JointMatrixRotation(joints[index]);
+        auto& span = spans[index];
+        span.rotation = PrepareQuaternionInterpolation(rotation, rotation);
+        span.translation = {
+            joints[index].values[3],
+            joints[index].values[7],
+            joints[index].values[11],
+        };
+        span.translationDelta = {};
+        ++g_viewCounters.preparedJointInterpolationSpans;
+    }
+}
+
+void CaptureJointInterpolationSpans(
+    const JointMatrix* previous, const JointMatrix* current,
+    std::size_t count, std::vector<JointInterpolationSpan>& spans) {
+    const bool reusePreviousRotations = spans.size() == count;
+    spans.resize(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const Quaternion previousRotation = reusePreviousRotations
+            ? spans[index].rotation.to
+            : JointMatrixRotation(previous[index]);
+        const Quaternion currentRotation =
+            JointMatrixRotation(current[index]);
+        auto& span = spans[index];
+        span.rotation = PrepareQuaternionInterpolation(
+            previousRotation, currentRotation);
+        span.translation = {
+            previous[index].values[3],
+            previous[index].values[7],
+            previous[index].values[11],
+        };
+        span.translationDelta = {
+            current[index].values[3] - previous[index].values[3],
+            current[index].values[7] - previous[index].values[7],
+            current[index].values[11] - previous[index].values[11],
+        };
+        ++g_viewCounters.preparedJointInterpolationSpans;
+        if (span.rotation.spherical) {
+            ++g_viewCounters.sphericalJointInterpolationSpans;
+        }
     }
 }
 
@@ -2133,9 +2224,8 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
                         jointCount * sizeof(joints[0]));
             std::memcpy(animation.current.data(), joints,
                         jointCount * sizeof(joints[0]));
-            CaptureJointRotations(joints, jointCount,
-                                  animation.currentRotations);
-            animation.previousRotations = animation.currentRotations;
+            SnapJointInterpolationSpans(
+                joints, jointCount, animation.interpolationSpans);
             animation.hasCurrent = true;
             animation.canInterpolate = false;
             animation.transitionGeneration = g_cameraSnapshotGeneration + 1;
@@ -2164,9 +2254,8 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
                         jointCount * sizeof(joints[0]));
             std::memcpy(animation.current.data(), joints,
                         jointCount * sizeof(joints[0]));
-            CaptureJointRotations(joints, jointCount,
-                                  animation.currentRotations);
-            animation.previousRotations = animation.currentRotations;
+            SnapJointInterpolationSpans(
+                joints, jointCount, animation.interpolationSpans);
             animation.transitionGeneration = transitionGeneration;
             animation.transitionSamples = 0;
             animation.sourceJoints = joints;
@@ -2178,11 +2267,11 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
                 ? (std::min)(animation.transitionSamples + 1u, 3u)
                 : 1u;
         animation.previous.swap(animation.current);
-        animation.previousRotations.swap(animation.currentRotations);
         std::memcpy(animation.current.data(), joints,
                     jointCount * sizeof(joints[0]));
-        CaptureJointRotations(joints, jointCount,
-                              animation.currentRotations);
+        CaptureJointInterpolationSpans(
+            animation.previous.data(), animation.current.data(), jointCount,
+            animation.interpolationSpans);
         animation.transitionGeneration = transitionGeneration;
         animation.transitionSamples = transitionSamples;
         animation.sourceJoints = joints;
@@ -2410,39 +2499,32 @@ std::array<float, 16> PoseToModelMatrix(const ViewEntityPose& pose) {
     };
 }
 
-void InterpolateJointMatrices(const std::vector<JointMatrix>& previous,
-                              const std::vector<JointMatrix>& current,
-                              const std::vector<Quaternion>& previousRotations,
-                              const std::vector<Quaternion>& currentRotations,
-                              std::vector<JointMatrix>& interpolated,
-                              double alpha) {
-    if (previousRotations.size() != current.size() ||
-        currentRotations.size() != current.size()) {
-        return;
-    }
-    interpolated.resize(current.size());
-    for (std::size_t index = 0; index < current.size(); ++index) {
-        const auto& from = previous[index].values;
-        const auto& to = current[index].values;
+void InterpolateJointMatrices(
+    const std::vector<JointInterpolationSpan>& spans,
+    std::vector<JointMatrix>& interpolated, double alpha) {
+    interpolated.resize(spans.size());
+    for (std::size_t index = 0; index < spans.size(); ++index) {
+        const auto& span = spans[index];
         auto& result = interpolated[index].values;
         const auto axis = QuaternionToMatrix(
-            Slerp(previousRotations[index], currentRotations[index], alpha));
+            InterpolateQuaternion(span.rotation, alpha));
         result = {
             axis[0], axis[3], axis[6],
-            static_cast<float>(from[3] + (to[3] - from[3]) * alpha),
+            static_cast<float>(span.translation[0] +
+                               span.translationDelta[0] * alpha),
             axis[1], axis[4], axis[7],
-            static_cast<float>(from[7] + (to[7] - from[7]) * alpha),
+            static_cast<float>(span.translation[1] +
+                               span.translationDelta[1] * alpha),
             axis[2], axis[5], axis[8],
-            static_cast<float>(from[11] + (to[11] - from[11]) * alpha),
+            static_cast<float>(span.translation[2] +
+                               span.translationDelta[2] * alpha),
         };
     }
 }
 
 void InterpolateJointMatrices(TrackedJointAnimation& animation,
                               double alpha) {
-    InterpolateJointMatrices(animation.previous, animation.current,
-                             animation.previousRotations,
-                             animation.currentRotations,
+    InterpolateJointMatrices(animation.interpolationSpans,
                              animation.interpolated, alpha);
 }
 
@@ -5363,7 +5445,9 @@ void ReportFrame() {
                                    "entity_candidate_max=%llu "
                                    "entity_candidate_rebuilds=%llu "
                                    "entity_candidate_source_scans=%llu "
-                                   "entity_candidate_visits=%llu\r\n",
+                                   "entity_candidate_visits=%llu "
+                                   "joint_spans_prepared=%llu "
+                                   "joint_spans_spherical=%llu\r\n",
                                    static_cast<long long>(g_reportStart),
                                    static_cast<long long>(now.QuadPart),
                                    static_cast<unsigned long long>(g_reportFrames), seconds,
@@ -5503,7 +5587,11 @@ void ReportFrame() {
                                    static_cast<unsigned long long>(
                                        g_viewCounters.presentationCandidateSourceScans),
                                    static_cast<unsigned long long>(
-                                       g_viewCounters.presentationCandidateVisits));
+                                       g_viewCounters.presentationCandidateVisits),
+                                   static_cast<unsigned long long>(
+                                       g_viewCounters.preparedJointInterpolationSpans),
+                                   static_cast<unsigned long long>(
+                                       g_viewCounters.sphericalJointInterpolationSpans));
     if (!g_interpolationTraceBuffer.empty()) {
         Log(g_interpolationTraceBuffer);
         g_interpolationTraceBuffer.clear();
@@ -6519,6 +6607,54 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
             !CameraSnapshotClockDebtExceeded(
                 0, kNativeTicMilliseconds, kNativeTicMilliseconds,
                 threeTics, frequency)) {
+            return false;
+        }
+
+        const std::uint64_t savedPreparedJointSpans =
+            g_viewCounters.preparedJointInterpolationSpans;
+        const std::uint64_t savedSphericalJointSpans =
+            g_viewCounters.sphericalJointInterpolationSpans;
+        JointMatrix previousJoint{};
+        previousJoint.values = {
+            1.0f, 0.0f, 0.0f, 1.0f,
+            0.0f, 1.0f, 0.0f, 2.0f,
+            0.0f, 0.0f, 1.0f, 3.0f,
+        };
+        JointMatrix currentJoint{};
+        currentJoint.values = {
+            0.0f, 1.0f, 0.0f, 5.0f,
+            -1.0f, 0.0f, 0.0f, 10.0f,
+            0.0f, 0.0f, 1.0f, 15.0f,
+        };
+        std::vector<JointInterpolationSpan> jointSpans;
+        SnapJointInterpolationSpans(&previousJoint, 1, jointSpans);
+        CaptureJointInterpolationSpans(
+            &previousJoint, &currentJoint, 1, jointSpans);
+        std::vector<JointMatrix> interpolatedJoints;
+        InterpolateJointMatrices(jointSpans, interpolatedJoints, 0.25);
+        const auto expectedJointAxis = QuaternionToMatrix(Slerp(
+            JointMatrixRotation(previousJoint),
+            JointMatrixRotation(currentJoint), 0.25));
+        const auto& interpolatedJoint = interpolatedJoints[0].values;
+        const bool jointSpanPassed =
+            jointSpans[0].rotation.spherical &&
+            close(interpolatedJoint[3], 2.0) &&
+            close(interpolatedJoint[7], 4.0) &&
+            close(interpolatedJoint[11], 6.0) &&
+            close(interpolatedJoint[0], expectedJointAxis[0]) &&
+            close(interpolatedJoint[4], expectedJointAxis[1]) &&
+            close(interpolatedJoint[8], expectedJointAxis[2]) &&
+            close(interpolatedJoint[1], expectedJointAxis[3]) &&
+            close(interpolatedJoint[5], expectedJointAxis[4]) &&
+            close(interpolatedJoint[9], expectedJointAxis[5]) &&
+            close(interpolatedJoint[2], expectedJointAxis[6]) &&
+            close(interpolatedJoint[6], expectedJointAxis[7]) &&
+            close(interpolatedJoint[10], expectedJointAxis[8]);
+        g_viewCounters.preparedJointInterpolationSpans =
+            savedPreparedJointSpans;
+        g_viewCounters.sphericalJointInterpolationSpans =
+            savedSphericalJointSpans;
+        if (!jointSpanPassed) {
             return false;
         }
         constexpr double cameraAlpha = 0.75;
