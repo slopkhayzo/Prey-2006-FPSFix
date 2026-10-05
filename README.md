@@ -71,12 +71,9 @@ The asynchronous-tic stabilization introduced in 1.0.4 remains unchanged. Only
 the confirmed native 16 ms timer thread receives its synthetic `timeGetTime`
 timeline; all other threads retain real Windows time.
 
-The lower-latency interpolation architecture is again the default. The newer
-one-native-tic authoritative buffer remains available through
-`compatibility.buffered_two_tic_interpolation`, defaulting to `false`, for
-systems that benefit from additional producer lookahead. Automatic checkpoint
-stall recovery and the configurable presentation-only `F10` reset remain
-available as independent safeguards.
+The interpolation architecture uses the latest two authoritative simulation
+states. Automatic checkpoint stall recovery and the configurable
+presentation-only `F10` reset remain available as independent safeguards.
 
 The underlying patch stack completed a full single-player playthrough at 360 Hz
 with no major issues observed and has also been exercised in focused tests at
@@ -163,12 +160,6 @@ value does not report whether G-SYNC itself is engaged.
 `interpolation.effects` advances the renderer's deterministic particle and
 material clock between native ticks. It does not run gameplay FX, scripts, or
 simulation more often.
-
-`compatibility.buffered_two_tic_interpolation` defaults to `false`. Enabling it
-keeps one completed native tic as authoritative presentation lookahead, which
-can tolerate irregular producer delivery but adds about 16 ms of positional
-presentation latency. It is not normally required with the stabilized async
-clock.
 
 `PreyHFR.log` is written beside `PreyHFR.asi`. Include it when reporting an
 issue. For a repeatable interpolation problem, enable

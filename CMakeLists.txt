@@ -21,6 +21,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Keep the instrumented retail-test build optimized like Release. CMake's
+# MSVC RelWithDebInfo default explicitly selects /Ob1 after /O2.
+if(MSVC)
+    string(REPLACE "/Ob1" "/Ob2" CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+endif()
+
 configure_file(
     cmake/preyhfr_version.h.in
     "${CMAKE_BINARY_DIR}/generated/preyhfr_version.h"
@@ -328,7 +335,7 @@ if(BUILD_TESTING)
         PROPERTIES WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     set_tests_properties(PreyHFRConfigValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
-            "presentation_fps=[0-9]+.*effects=on.*buffered_two_tic_interpolation=off.*display_mode=borderless")
+            "presentation_fps=[0-9]+.*effects=on.*display_mode=borderless")
     set_tests_properties(PreyHFRConfigOverrideValidation PROPERTIES
         PASS_REGULAR_EXPRESSION
             "presentation_fps=144.*display_mode=windowed")

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <intrin.h>
@@ -134,7 +135,6 @@ constexpr std::size_t kMaximumPeekedMouseEvents = 256;
 constexpr std::size_t kMaximumTrackedMouseDeltas = 4096;
 constexpr std::size_t kTrackedUsercmdCount = 128;
 constexpr std::size_t kProducedCameraSnapshotQueueSize = 8;
-constexpr std::size_t kProducedEntitySnapshotQueueSize = 4;
 constexpr std::size_t kAsyncTimerTraceCapacity = 4096;
 constexpr GUID kSystemMouseGuid{
     0x6f1d2b60, 0xd5a0, 0x11cf,
@@ -247,7 +247,6 @@ bool g_mouseInterpolationRequested = false;
 bool g_continuousSnapshotTimingRequested = false;
 bool g_multiTicEntityAlignmentRequested = false;
 bool g_overdueSnapshotFallbackRequested = false;
-bool g_bufferedTwoTicInterpolationRequested = false;
 bool g_interpolationTraceRequested = false;
 unsigned int g_timelineResetVirtualKey = 0;
 bool g_timelineResetKeyDown = false;
@@ -362,13 +361,10 @@ struct MouseFrameProbe {
     std::uint64_t includedSerialBefore = 0;
     std::uint64_t includedSerialAfter = 0;
     std::uint64_t selectedSerial = 0;
-    std::uint64_t bufferedPreviousSerial = 0;
-    std::uint64_t bufferedCurrentSerial = 0;
     int peekDeltaX = 0;
     int peekDeltaY = 0;
     bool tracked = false;
     bool peeked = false;
-    bool buffered = false;
 };
 
 MouseFrameProbe g_mouseFrameProbe{};
@@ -442,6 +438,10 @@ struct ViewCounters {
     std::uint64_t viewModelPendingAnimations = 0;
     std::uint64_t worldPendingRoots = 0;
     std::uint64_t worldPendingAnimations = 0;
+    std::uint64_t presentationCandidateRebuilds = 0;
+    std::uint64_t presentationCandidateSourceScans = 0;
+    std::uint64_t presentationCandidateVisits = 0;
+    std::uint64_t maximumPresentationCandidates = 0;
     double maximumOriginStep = 0.0;
 };
 
@@ -465,9 +465,6 @@ struct CameraFrameProbe {
     std::uint32_t resetMask = 0;
     std::uint32_t producerBridgeSamples = 0;
     std::int64_t producerEarlyClampQpc = 0;
-    std::uint32_t producerBufferDepth = 0;
-    std::uint32_t producerBufferAdvances = 0;
-    std::uint32_t producerSettledAdvances = 0;
     bool fovInterpolated = false;
 };
 
@@ -504,11 +501,6 @@ std::array<ProducedCameraSnapshot, kProducedCameraSnapshotQueueSize>
     g_producedCameraSnapshots{};
 std::uint64_t g_latestProducedCameraSequence = 0;
 std::uint64_t g_consumedCameraProductionSequence = 0;
-std::uint64_t g_cameraPreviousProductionSequence = 0;
-std::uint64_t g_cameraCurrentProductionSequence = 0;
-std::uint64_t g_cameraPreviousMouseSerial = 0;
-std::uint64_t g_cameraCurrentMouseSerial = 0;
-bool g_authoritativeCameraBufferActive = false;
 bool g_havePreviousView = false;
 std::int32_t g_previousViewTime = 0;
 std::int32_t g_previousViewId = 0;
@@ -541,6 +533,13 @@ struct alignas(16) JointMatrix {
 static_assert(sizeof(JointMatrix) == 48,
               "Retail idJointMat is expected to contain twelve floats");
 
+struct Quaternion {
+    double w = 1.0;
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
 struct TrackedJointAnimation {
     bool hasCurrent = false;
     bool canInterpolate = false;
@@ -551,20 +550,8 @@ struct TrackedJointAnimation {
     std::vector<JointMatrix> previous;
     std::vector<JointMatrix> current;
     std::vector<JointMatrix> interpolated;
-};
-
-struct ProducedEntityPoseSnapshot {
-    ViewEntityPose pose{};
-    std::uint64_t sequence = 0;
-    bool valid = false;
-    bool canInterpolateFromPrevious = false;
-};
-
-struct ProducedEntityAnimationSnapshot {
-    std::vector<JointMatrix> joints;
-    std::uint64_t sequence = 0;
-    bool valid = false;
-    bool canInterpolateFromPrevious = false;
+    std::vector<Quaternion> previousRotations;
+    std::vector<Quaternion> currentRotations;
 };
 
 struct RenderEntityIdentity {
@@ -596,18 +583,21 @@ struct TrackedRenderEntity {
     std::uint64_t transitionGeneration = 0;
     std::uint32_t transitionSamples = 0;
     std::uint64_t firstInterpolatableGeneration = 0;
+    const void* validatedLiveEntity = nullptr;
     ViewEntityPose previous{};
     ViewEntityPose current{};
     TrackedJointAnimation animation{};
-    std::array<ProducedEntityPoseSnapshot,
-               kProducedEntitySnapshotQueueSize> producedPoses{};
-    std::array<ProducedEntityAnimationSnapshot,
-               kProducedEntitySnapshotQueueSize> producedAnimations{};
 };
 
 std::array<TrackedRenderEntity, kMaximumRenderEntityHandles> g_renderEntities{};
 std::array<int, kMaximumRenderEntityHandles> g_activeRenderEntityHandles{};
 std::size_t g_activeRenderEntityCount = 0;
+std::array<int, kMaximumRenderEntityHandles>
+    g_presentationCandidateHandles{};
+std::size_t g_presentationCandidateCount = 0;
+std::uint64_t g_presentationCandidateGeneration =
+    (std::numeric_limits<std::uint64_t>::max)();
+bool g_presentationCandidatesDirty = true;
 std::uint32_t g_nextRenderEntityGeneration = 1;
 void* g_renderWorld = nullptr;
 void** g_renderWorldVtable = nullptr;
@@ -1363,13 +1353,6 @@ bool PeekPendingMouse(int& deltaX, int& deltaY) {
     return deltaX != 0 || deltaY != 0;
 }
 
-struct Quaternion {
-    double w = 1.0;
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
-
 Quaternion Normalize(Quaternion value) {
     const double length = std::sqrt(value.w * value.w + value.x * value.x +
                                     value.y * value.y + value.z * value.z);
@@ -1500,15 +1483,6 @@ bool SumMouseDeltasLocked(std::uint64_t firstSerial,
     return true;
 }
 
-std::array<double, 2> ComposeBufferedMouseOverlay(
-    double transitionYaw, double transitionPitch,
-    double liveYaw, double livePitch, double interpolationAlpha) {
-    const double remaining =
-        std::clamp(1.0 - interpolationAlpha, 0.0, 1.0);
-    return {liveYaw + transitionYaw * remaining,
-            livePitch + transitionPitch * remaining};
-}
-
 bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
                             bool cameraInterpolated, double& yaw,
                             double& pitch) {
@@ -1553,50 +1527,12 @@ bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
         g_mouseTransitionPitch = 0.0;
     }
 
-    // The authoritative camera path deliberately presents the previous
-    // producer interval.  The normal retirement cursor follows the newest
-    // simulation view, so using it as the overlay cutoff would retire mouse
-    // input one tic before the delayed camera displays it.  Reconstruct the
-    // overlay relative to the actual buffered camera pair instead: finish the
-    // not-yet-presented fraction of previous->current, then apply everything
-    // newer than current at full strength.
-    const bool buffered = cameraInterpolated &&
-        g_authoritativeCameraBufferActive;
-    if (valid && buffered) {
-        const std::uint64_t current =
-            std::min(g_cameraCurrentMouseSerial, latest);
-        const std::uint64_t previous =
-            std::min(g_cameraPreviousMouseSerial, current);
-        double transitionYaw = 0.0;
-        double transitionPitch = 0.0;
-        double liveYaw = 0.0;
-        double livePitch = 0.0;
-        if (current > previous) {
-            valid = SumMouseDeltasLocked(previous + 1, current,
-                                         transitionYaw, transitionPitch);
-        }
-        if (valid && latest > current) {
-            valid = SumMouseDeltasLocked(current + 1, latest,
-                                         liveYaw, livePitch);
-        }
-        if (valid) {
-            const auto composed = ComposeBufferedMouseOverlay(
-                transitionYaw, transitionPitch, liveYaw, livePitch,
-                interpolationAlpha);
-            yaw = composed[0];
-            pitch = composed[1];
-        }
-        g_mouseFrameProbe.buffered = true;
-        g_mouseFrameProbe.bufferedPreviousSerial = previous;
-        g_mouseFrameProbe.bufferedCurrentSerial = current;
-        g_mouseFrameProbe.transitionYaw = transitionYaw;
-        g_mouseFrameProbe.transitionPitch = transitionPitch;
-    } else if (valid && latest > g_includedMouseSerial) {
+    if (valid && latest > g_includedMouseSerial) {
         valid = SumMouseDeltasLocked(g_includedMouseSerial + 1, latest,
                                      yaw, pitch);
     }
 
-    if (valid && cameraInterpolated && !buffered) {
+    if (valid && cameraInterpolated) {
         const double remaining =
             std::clamp(1.0 - interpolationAlpha, 0.0, 1.0);
         yaw += g_mouseTransitionYaw * remaining;
@@ -1611,10 +1547,8 @@ bool GetTrackedMouseOverlay(const void* view, double interpolationAlpha,
         ++g_mouseCounters.ledgerOverflows;
     }
     g_mouseFrameProbe.includedSerialAfter = g_includedMouseSerial;
-    if (!buffered) {
-        g_mouseFrameProbe.transitionYaw = g_mouseTransitionYaw;
-        g_mouseFrameProbe.transitionPitch = g_mouseTransitionPitch;
-    }
+    g_mouseFrameProbe.transitionYaw = g_mouseTransitionYaw;
+    g_mouseFrameProbe.transitionPitch = g_mouseTransitionPitch;
     ReleaseSRWLockExclusive(&g_mouseLedgerLock);
     return valid && (yaw != 0.0 || pitch != 0.0);
 }
@@ -1943,6 +1877,7 @@ TrackedRenderEntity* FindTrackedRenderEntity(int handle) {
 void ForgetRenderEntity(int handle) {
     auto* entity = FindTrackedRenderEntity(handle);
     if (entity == nullptr) return;
+    g_presentationCandidatesDirty = true;
     const std::size_t removedIndex = entity->activeIndex;
     const std::size_t lastIndex = --g_activeRenderEntityCount;
     if (removedIndex != lastIndex) {
@@ -1962,6 +1897,7 @@ void ForgetRenderEntity(int handle) {
 }
 
 void ResetTrackedEntityInterpolation() {
+    g_presentationCandidatesDirty = true;
     for (std::size_t index = 0; index < g_activeRenderEntityCount; ++index) {
         auto* entity = FindTrackedRenderEntity(g_activeRenderEntityHandles[index]);
         if (entity == nullptr || !entity->hasCurrent) continue;
@@ -1970,23 +1906,10 @@ void ResetTrackedEntityInterpolation() {
         entity->transitionSamples = 0;
         if (entity->animation.hasCurrent) {
             entity->animation.previous = entity->animation.current;
+            entity->animation.previousRotations =
+                entity->animation.currentRotations;
             entity->animation.canInterpolate = false;
             entity->animation.transitionSamples = 0;
-        }
-    }
-}
-
-void ClearProducedRenderEntityHistories() {
-    for (std::size_t index = 0; index < g_activeRenderEntityCount; ++index) {
-        auto* entity = FindTrackedRenderEntity(
-            g_activeRenderEntityHandles[index]);
-        if (entity == nullptr) continue;
-        for (auto& snapshot : entity->producedPoses) snapshot = {};
-        for (auto& snapshot : entity->producedAnimations) {
-            snapshot.sequence = 0;
-            snapshot.valid = false;
-            snapshot.canInterpolateFromPrevious = false;
-            snapshot.joints.clear();
         }
     }
 }
@@ -2013,17 +1936,11 @@ void ResetPresentationTimelineManually() {
     g_cameraTimelineSynchronized = false;
     g_cameraPhaseRecoveryActive = false;
     g_cameraPhaseRecoveryCandidateQpc = 0;
-    g_authoritativeCameraBufferActive = false;
-    g_cameraPreviousProductionSequence = 0;
-    g_cameraCurrentProductionSequence = 0;
-    g_cameraPreviousMouseSerial = 0;
-    g_cameraCurrentMouseSerial = 0;
     g_consumedCameraProductionSequence = 0;
     g_havePreviousView = false;
     g_haveMouseViewTime = false;
     g_mouseTransitionYaw = 0.0;
     g_mouseTransitionPitch = 0.0;
-    ClearProducedRenderEntityHistories();
     ResetTrackedEntityInterpolation();
 
     LARGE_INTEGER now{};
@@ -2102,9 +2019,10 @@ void RecalculateTrackedWorldJointMatrices() {
 
 bool ViewModelJointPoseDiscontinuous(
     const std::vector<JointMatrix>& previous,
-    const std::vector<JointMatrix>& current) {
-    if (previous.size() != current.size()) return true;
-    for (std::size_t index = 0; index < current.size(); ++index) {
+    const JointMatrix* current,
+    std::size_t currentCount) {
+    if (previous.size() != currentCount) return true;
+    for (std::size_t index = 0; index < currentCount; ++index) {
         const auto& from = previous[index].values;
         const auto& to = current[index].values;
         const double x = static_cast<double>(to[3] - from[3]);
@@ -2134,6 +2052,23 @@ bool ViewModelJointPoseDiscontinuous(
     return false;
 }
 
+Quaternion JointMatrixRotation(const JointMatrix& joint) {
+    const auto& values = joint.values;
+    return MatrixToQuaternion({
+        values[0], values[4], values[8],
+        values[1], values[5], values[9],
+        values[2], values[6], values[10],
+    });
+}
+
+void CaptureJointRotations(const JointMatrix* joints, std::size_t count,
+                           std::vector<Quaternion>& rotations) {
+    rotations.resize(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        rotations[index] = JointMatrixRotation(joints[index]);
+    }
+}
+
 void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
                                const void* renderEntity) {
     const bool animationRequested = tracked.allowViewId == 0
@@ -2158,9 +2093,9 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
     }
 
     try {
-        std::vector<JointMatrix> sample(static_cast<std::size_t>(count));
-        std::memcpy(sample.data(), joints, sample.size() * sizeof(sample[0]));
-        for (const auto& joint : sample) {
+        const std::size_t jointCount = static_cast<std::size_t>(count);
+        for (std::size_t index = 0; index < jointCount; ++index) {
+            const auto& joint = joints[index];
             for (const float value : joint.values) {
                 if (!std::isfinite(value)) {
                     ClearTrackedJointAnimation(tracked);
@@ -2172,7 +2107,7 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
 
         auto& animation = tracked.animation;
         if (!animation.hasCurrent ||
-            animation.current.size() != sample.size()) {
+            animation.current.size() != jointCount) {
             std::size_t retainedWorldCount = 0;
             if (tracked.allowViewId == 0) {
                 const std::size_t oldCount = animation.hasCurrent
@@ -2182,7 +2117,7 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
                     oldCount <= g_trackedWorldJointMatrices
                         ? g_trackedWorldJointMatrices - oldCount
                         : 0;
-                if (sample.size() >
+                if (jointCount >
                     kMaximumTrackedWorldJointMatrices -
                         (std::min)(retainedWorldCount,
                                    kMaximumTrackedWorldJointMatrices)) {
@@ -2191,9 +2126,16 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
                     return;
                 }
             }
-            animation.previous = sample;
-            animation.current = std::move(sample);
-            animation.interpolated.resize(animation.current.size());
+            animation.previous.resize(jointCount);
+            animation.current.resize(jointCount);
+            animation.interpolated.resize(jointCount);
+            std::memcpy(animation.previous.data(), joints,
+                        jointCount * sizeof(joints[0]));
+            std::memcpy(animation.current.data(), joints,
+                        jointCount * sizeof(joints[0]));
+            CaptureJointRotations(joints, jointCount,
+                                  animation.currentRotations);
+            animation.previousRotations = animation.currentRotations;
             animation.hasCurrent = true;
             animation.canInterpolate = false;
             animation.transitionGeneration = g_cameraSnapshotGeneration + 1;
@@ -2205,8 +2147,8 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
             }
             return;
         }
-        if (std::memcmp(sample.data(), animation.current.data(),
-                        sample.size() * sizeof(sample[0])) == 0) {
+        if (std::memcmp(joints, animation.current.data(),
+                        jointCount * sizeof(joints[0])) == 0) {
             animation.sourceJoints = joints;
             return;
         }
@@ -2215,11 +2157,16 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
             g_cameraSnapshotGeneration + 1;
         const bool viewModelDiscontinuity = tracked.allowViewId != 0 &&
             (animation.sourceJoints != joints ||
-             ViewModelJointPoseDiscontinuous(animation.current, sample));
+             ViewModelJointPoseDiscontinuous(animation.current, joints,
+                                              jointCount));
         if (viewModelDiscontinuity) {
-            animation.previous = sample;
-            animation.current = std::move(sample);
-            animation.interpolated.resize(animation.current.size());
+            std::memcpy(animation.previous.data(), joints,
+                        jointCount * sizeof(joints[0]));
+            std::memcpy(animation.current.data(), joints,
+                        jointCount * sizeof(joints[0]));
+            CaptureJointRotations(joints, jointCount,
+                                  animation.currentRotations);
+            animation.previousRotations = animation.currentRotations;
             animation.transitionGeneration = transitionGeneration;
             animation.transitionSamples = 0;
             animation.sourceJoints = joints;
@@ -2230,9 +2177,12 @@ void ObserveRenderEntityJoints(TrackedRenderEntity& tracked,
             animation.transitionGeneration == transitionGeneration
                 ? (std::min)(animation.transitionSamples + 1u, 3u)
                 : 1u;
-        animation.previous = std::move(animation.current);
-        animation.current = std::move(sample);
-        animation.interpolated.resize(animation.current.size());
+        animation.previous.swap(animation.current);
+        animation.previousRotations.swap(animation.currentRotations);
+        std::memcpy(animation.current.data(), joints,
+                    jointCount * sizeof(joints[0]));
+        CaptureJointRotations(joints, jointCount,
+                              animation.currentRotations);
         animation.transitionGeneration = transitionGeneration;
         animation.transitionSamples = transitionSamples;
         animation.sourceJoints = joints;
@@ -2262,6 +2212,10 @@ void ClearTrackedRenderEntities() {
         }
     }
     g_activeRenderEntityCount = 0;
+    g_presentationCandidateCount = 0;
+    g_presentationCandidateGeneration =
+        (std::numeric_limits<std::uint64_t>::max)();
+    g_presentationCandidatesDirty = true;
     g_trackedWorldJointMatrices = 0;
 }
 
@@ -2319,6 +2273,7 @@ void ObserveRenderEntity(int handle, const void* renderEntity, bool created) {
         ForgetRenderEntity(handle);
         return;
     }
+    g_presentationCandidatesDirty = true;
 
     if (static_cast<std::size_t>(handle) >= g_renderEntities.size()) {
         ++g_viewCounters.worldEntityCapacitySkips;
@@ -2406,139 +2361,10 @@ void ObserveRenderEntity(int handle, const void* renderEntity, bool created) {
     }
 }
 
-void CaptureProducedRenderEntitySnapshot(TrackedRenderEntity& tracked,
-                                         std::uint64_t sequence) {
-    if (sequence == 0) return;
-        auto& pose = tracked.producedPoses[static_cast<std::size_t>(
-            sequence % kProducedEntitySnapshotQueueSize)];
-        const auto& previousPose = tracked.producedPoses[
-            static_cast<std::size_t>(
-                (sequence - 1) % kProducedEntitySnapshotQueueSize)];
-        pose = {};
-        pose.sequence = sequence;
-        pose.valid = tracked.hasCurrent;
-        if (pose.valid) {
-            pose.pose = tracked.current;
-            const bool worldEntity = tracked.allowViewId == 0;
-            const double maximumStep = worldEntity
-                ? g_maximumWorldEntityStep
-                : kMaximumViewModelStep;
-            const double maximumAngle = worldEntity
-                ? g_maximumWorldEntityAngleDegrees
-                : kMaximumViewModelAngleDegrees;
-            pose.canInterpolateFromPrevious = previousPose.valid &&
-                previousPose.sequence + 1 == sequence &&
-                PoseOriginDistance(previousPose.pose, pose.pose) <=
-                    maximumStep &&
-                PoseAxisAngleDegrees(previousPose.pose, pose.pose) <=
-                    maximumAngle;
-        }
-
-        auto& animation = tracked.producedAnimations[
-            static_cast<std::size_t>(
-                sequence % kProducedEntitySnapshotQueueSize)];
-        const auto& previousAnimation = tracked.producedAnimations[
-            static_cast<std::size_t>(
-                (sequence - 1) % kProducedEntitySnapshotQueueSize)];
-        animation.sequence = sequence;
-        animation.valid = false;
-        animation.canInterpolateFromPrevious = false;
-        animation.joints.clear();
-        if (!tracked.animation.hasCurrent) return;
-        try {
-            animation.joints = tracked.animation.current;
-            animation.valid = true;
-            animation.canInterpolateFromPrevious =
-                previousAnimation.valid &&
-                previousAnimation.sequence + 1 == sequence &&
-                previousAnimation.joints.size() == animation.joints.size() &&
-                (tracked.allowViewId == 0 ||
-                 !ViewModelJointPoseDiscontinuous(
-                     previousAnimation.joints, animation.joints));
-        } catch (...) {
-            animation.joints.clear();
-            CountAnimationSkip(tracked);
-        }
-}
-
-const ProducedEntityPoseSnapshot* FindProducedEntityPose(
-    const TrackedRenderEntity& tracked, std::uint64_t sequence) {
-    if (sequence == 0) return nullptr;
-    const ProducedEntityPoseSnapshot* match = nullptr;
-    for (const auto& snapshot : tracked.producedPoses) {
-        if (snapshot.valid && snapshot.sequence <= sequence &&
-            (match == nullptr || snapshot.sequence > match->sequence)) {
-            match = &snapshot;
-        }
-    }
-    return match;
-}
-
-const ProducedEntityAnimationSnapshot* FindProducedEntityAnimation(
-    const TrackedRenderEntity& tracked, std::uint64_t sequence) {
-    if (sequence == 0) return nullptr;
-    const ProducedEntityAnimationSnapshot* match = nullptr;
-    for (const auto& snapshot : tracked.producedAnimations) {
-        if (snapshot.valid && snapshot.sequence <= sequence &&
-            (match == nullptr || snapshot.sequence > match->sequence)) {
-            match = &snapshot;
-        }
-    }
-    return match;
-}
-
-const ProducedEntityPoseSnapshot* FindLatestProducedEntityPose(
-    const TrackedRenderEntity& tracked) {
-    const ProducedEntityPoseSnapshot* latest = nullptr;
-    for (const auto& snapshot : tracked.producedPoses) {
-        if (snapshot.valid &&
-            (latest == nullptr || snapshot.sequence > latest->sequence)) {
-            latest = &snapshot;
-        }
-    }
-    return latest;
-}
-
-const ProducedEntityAnimationSnapshot* FindLatestProducedEntityAnimation(
-    const TrackedRenderEntity& tracked) {
-    const ProducedEntityAnimationSnapshot* latest = nullptr;
-    for (const auto& snapshot : tracked.producedAnimations) {
-        if (snapshot.valid &&
-            (latest == nullptr || snapshot.sequence > latest->sequence)) {
-            latest = &snapshot;
-        }
-    }
-    return latest;
-}
-
-bool JointMatricesEqual(const std::vector<JointMatrix>& left,
-                        const std::vector<JointMatrix>& right) {
-    return left.size() == right.size() &&
-        (left.empty() ||
-         std::memcmp(left.data(), right.data(),
-                     left.size() * sizeof(left[0])) == 0);
-}
-
-bool BufferedEntityHistoryNeedsPresentation(bool samplesDiffer,
-                                            bool canInterpolate,
-                                            std::uint64_t latestSequence,
-                                            std::uint64_t displayedSequence) {
-    // A carried-forward sample is only a description of state, not evidence
-    // that the live render entity must be rewritten.  Present it when there
-    // is an actual interpolation span, or when a newer captured state proves
-    // the live entity is ahead of the delayed camera playhead.
-    return (samplesDiffer && canInterpolate) ||
-           latestSequence > displayedSequence;
-}
-
 int __fastcall HookedAddEntityDef(void* self, void*, const void* renderEntity) {
     const int handle = g_originalAddEntityDef(self, renderEntity);
     if (self == g_renderWorld) {
         ObserveRenderEntity(handle, renderEntity, true);
-        if (auto* tracked = FindTrackedRenderEntity(handle)) {
-            CaptureProducedRenderEntitySnapshot(
-                *tracked, g_latestProducedCameraSequence);
-        }
     }
     return handle;
 }
@@ -2551,10 +2377,6 @@ void __fastcall HookedUpdateEntityDef(void* self, void*, int handle,
             tracked->animation.cacheWasInterpolated = false;
         }
         ObserveRenderEntity(handle, renderEntity, false);
-        if (auto* tracked = FindTrackedRenderEntity(handle)) {
-            CaptureProducedRenderEntitySnapshot(
-                *tracked, g_latestProducedCameraSequence);
-        }
     }
 }
 
@@ -2578,7 +2400,6 @@ struct AppliedViewEntityPose {
 
 std::array<AppliedViewEntityPose, kMaximumAppliedEntityPoses>
     g_appliedEntityPoses{};
-std::uint64_t g_lastAnimatedWorldTraceSequence = 0;
 
 std::array<float, 16> PoseToModelMatrix(const ViewEntityPose& pose) {
     return {
@@ -2591,26 +2412,21 @@ std::array<float, 16> PoseToModelMatrix(const ViewEntityPose& pose) {
 
 void InterpolateJointMatrices(const std::vector<JointMatrix>& previous,
                               const std::vector<JointMatrix>& current,
+                              const std::vector<Quaternion>& previousRotations,
+                              const std::vector<Quaternion>& currentRotations,
                               std::vector<JointMatrix>& interpolated,
                               double alpha) {
+    if (previousRotations.size() != current.size() ||
+        currentRotations.size() != current.size()) {
+        return;
+    }
     interpolated.resize(current.size());
     for (std::size_t index = 0; index < current.size(); ++index) {
         const auto& from = previous[index].values;
         const auto& to = current[index].values;
         auto& result = interpolated[index].values;
-        const std::array<float, 9> fromAxis{
-            from[0], from[4], from[8],
-            from[1], from[5], from[9],
-            from[2], from[6], from[10],
-        };
-        const std::array<float, 9> toAxis{
-            to[0], to[4], to[8],
-            to[1], to[5], to[9],
-            to[2], to[6], to[10],
-        };
         const auto axis = QuaternionToMatrix(
-            Slerp(MatrixToQuaternion(fromAxis), MatrixToQuaternion(toAxis),
-                  alpha));
+            Slerp(previousRotations[index], currentRotations[index], alpha));
         result = {
             axis[0], axis[3], axis[6],
             static_cast<float>(from[3] + (to[3] - from[3]) * alpha),
@@ -2625,6 +2441,8 @@ void InterpolateJointMatrices(const std::vector<JointMatrix>& previous,
 void InterpolateJointMatrices(TrackedJointAnimation& animation,
                               double alpha) {
     InterpolateJointMatrices(animation.previous, animation.current,
+                             animation.previousRotations,
+                             animation.currentRotations,
                              animation.interpolated, alpha);
 }
 
@@ -2638,7 +2456,6 @@ bool ClearRenderEntityDynamicModel(const void* renderEntity) {
     auto* local = const_cast<std::uint8_t*>(
         static_cast<const std::uint8_t*>(renderEntity)) -
         kRenderEntityLocalPrefixSize;
-    if (!IsReadableRange(local, kRenderEntityLocalValidationSize)) return false;
     g_clearEntityDefDynamicModel(local);
     return true;
 }
@@ -2689,10 +2506,7 @@ void ApplyMouseOverlayToPose(ViewEntityPose& pose,
 bool ResolveRenderEntityModelMatrixOffset(
     const void* renderEntity, const std::array<float, 16>& expectedMatrix) {
     if (g_renderEntityModelMatrixOffset != 0) {
-        return IsReadableRange(
-            static_cast<const std::uint8_t*>(renderEntity) +
-                g_renderEntityModelMatrixOffset,
-            kRenderEntityModelMatrixSize);
+        return true;
     }
 
     if (!IsReadableRange(
@@ -2727,6 +2541,70 @@ bool ResolveRenderEntityModelMatrixOffset(
     return true;
 }
 
+bool ValidateLiveRenderEntity(TrackedRenderEntity& tracked,
+                              const void* renderEntity) {
+    if (tracked.validatedLiveEntity == renderEntity) return true;
+    const auto* local = static_cast<const std::uint8_t*>(renderEntity) -
+        kRenderEntityLocalPrefixSize;
+    if (!IsReadableRange(local, kRenderEntityLocalValidationSize)) {
+        return false;
+    }
+    tracked.validatedLiveEntity = renderEntity;
+    return true;
+}
+
+bool TransitionCanReachPresentation(std::uint64_t generation) {
+    return generation == g_cameraSnapshotGeneration ||
+           generation == g_cameraSnapshotGeneration + 1;
+}
+
+bool IsPresentationCandidate(const TrackedRenderEntity& tracked) {
+    if (!tracked.hasCurrent) return false;
+    const bool viewModel = tracked.allowViewId != 0;
+    const bool rootRequested = viewModel
+        ? g_viewModelInterpolationRequested
+        : g_worldInterpolationRequested;
+    const bool rootCandidate = rootRequested &&
+        ((tracked.canInterpolate &&
+          TransitionCanReachPresentation(tracked.transitionGeneration)) ||
+         (viewModel && g_mouseInterpolationRequested));
+    const bool animationRequested = viewModel
+        ? g_viewModelAnimationInterpolationRequested
+        : g_worldAnimationInterpolationRequested;
+    const bool animationCandidate = animationRequested &&
+        (tracked.animation.cacheWasInterpolated ||
+         (tracked.animation.hasCurrent &&
+          tracked.animation.canInterpolate &&
+          TransitionCanReachPresentation(
+              tracked.animation.transitionGeneration)));
+    return rootCandidate || animationCandidate;
+}
+
+void RefreshPresentationCandidates() {
+    if (!g_presentationCandidatesDirty &&
+        g_presentationCandidateGeneration == g_cameraSnapshotGeneration) {
+        return;
+    }
+    ++g_viewCounters.presentationCandidateRebuilds;
+    g_viewCounters.presentationCandidateSourceScans +=
+        g_activeRenderEntityCount;
+    g_presentationCandidateCount = 0;
+    for (std::size_t index = 0; index < g_activeRenderEntityCount; ++index) {
+        const int handle = g_activeRenderEntityHandles[index];
+        const auto* tracked = FindTrackedRenderEntity(handle);
+        if (tracked == nullptr || !IsPresentationCandidate(*tracked)) {
+            continue;
+        }
+        g_presentationCandidateHandles[g_presentationCandidateCount++] =
+            handle;
+    }
+    g_presentationCandidateGeneration = g_cameraSnapshotGeneration;
+    g_presentationCandidatesDirty = false;
+    g_viewCounters.maximumPresentationCandidates = (std::max)(
+        g_viewCounters.maximumPresentationCandidates,
+        static_cast<std::uint64_t>(g_presentationCandidateCount));
+}
+
 double EntityInterpolationAlpha(bool pending, std::uint32_t transitionSamples,
                                 double cameraAlpha, double latestTicAlpha,
                                 double pendingTicAlpha,
@@ -2754,136 +2632,47 @@ std::size_t ApplyInterpolatedRenderEntities(
         (viewId == 0 && !g_worldInterpolationRequested &&
          !g_worldAnimationInterpolationRequested)) return 0;
 
+    RefreshPresentationCandidates();
+    g_viewCounters.presentationCandidateVisits +=
+        g_presentationCandidateCount;
     std::size_t count = 0;
     std::uint64_t adjustedViewModels = 0;
     std::uint64_t adjustedWorldEntities = 0;
-    for (std::size_t activeIndex = 0;
-         activeIndex < g_activeRenderEntityCount; ++activeIndex) {
-        const int handle = g_activeRenderEntityHandles[activeIndex];
+    for (std::size_t candidateIndex = 0;
+         candidateIndex < g_presentationCandidateCount; ++candidateIndex) {
+        const int handle = g_presentationCandidateHandles[candidateIndex];
         auto* tracked = FindTrackedRenderEntity(handle);
         if (tracked == nullptr || !tracked->hasCurrent) continue;
         const bool viewModel = tracked->allowViewId != 0;
-        const auto* bufferedPreviousPose =
-            g_authoritativeCameraBufferActive
-            ? FindProducedEntityPose(
-                  *tracked, g_cameraPreviousProductionSequence)
-            : nullptr;
-        const auto* bufferedCurrentPose =
-            g_authoritativeCameraBufferActive
-            ? FindProducedEntityPose(
-                  *tracked, g_cameraCurrentProductionSequence)
-            : nullptr;
-        const bool bufferedPoseAvailable = bufferedPreviousPose != nullptr &&
-            bufferedCurrentPose != nullptr;
-        const auto* latestBufferedPose = bufferedPoseAvailable
-            ? FindLatestProducedEntityPose(*tracked)
-            : nullptr;
-        const bool bufferedPoseChanged = bufferedPoseAvailable &&
-            std::memcmp(&bufferedPreviousPose->pose,
-                        &bufferedCurrentPose->pose,
-                        sizeof(bufferedPreviousPose->pose)) != 0;
-        const double bufferedMaximumStep = viewModel
-            ? kMaximumViewModelStep
-            : g_maximumWorldEntityStep;
-        const double bufferedMaximumAngle = viewModel
-            ? kMaximumViewModelAngleDegrees
-            : g_maximumWorldEntityAngleDegrees;
-        const bool bufferedPoseInterpolatable = bufferedPoseChanged &&
-            PoseOriginDistance(bufferedPreviousPose->pose,
-                               bufferedCurrentPose->pose) <=
-                bufferedMaximumStep &&
-            PoseAxisAngleDegrees(bufferedPreviousPose->pose,
-                                 bufferedCurrentPose->pose) <=
-                bufferedMaximumAngle;
-        const bool bufferedPoseNeedsPresentation =
-            bufferedPoseAvailable &&
-            BufferedEntityHistoryNeedsPresentation(
-                bufferedPoseChanged, bufferedPoseInterpolatable,
-                latestBufferedPose != nullptr
-                    ? latestBufferedPose->sequence
-                    : 0,
-                g_cameraCurrentProductionSequence);
-        const bool useBufferedPose = g_authoritativeCameraBufferActive &&
-            bufferedPoseNeedsPresentation;
-        const bool currentPose = !g_authoritativeCameraBufferActive &&
-            tracked->canInterpolate &&
+        const bool currentPose = tracked->canInterpolate &&
             tracked->transitionGeneration == g_cameraSnapshotGeneration;
-        const bool pendingPose = !g_authoritativeCameraBufferActive &&
-            g_overdueSnapshotFallbackRequested &&
+        const bool pendingPose = g_overdueSnapshotFallbackRequested &&
             tracked->canInterpolate &&
             tracked->transitionGeneration == g_cameraSnapshotGeneration + 1;
-        const bool interpolatePose = g_authoritativeCameraBufferActive
-            ? bufferedPoseInterpolatable
-            : currentPose || pendingPose;
+        const bool interpolatePose = currentPose || pendingPose;
         const bool applyRoot = viewModel
             ? g_viewModelInterpolationRequested &&
                   tracked->allowViewId == viewId &&
-                  ((cameraInterpolated &&
-                    (g_authoritativeCameraBufferActive
-                         ? bufferedPoseNeedsPresentation
-                         : interpolatePose)) ||
+                  ((cameraInterpolated && interpolatePose) ||
                    mouseOverlay.applied)
             : g_worldInterpolationRequested && cameraInterpolated &&
-                  (g_authoritativeCameraBufferActive
-                       ? bufferedPoseNeedsPresentation
-                       : interpolatePose);
+                  interpolatePose;
         const bool animationRequested = viewModel
             ? g_viewModelAnimationInterpolationRequested
             : g_worldAnimationInterpolationRequested;
         const bool animationMatchesView = !viewModel ||
             tracked->allowViewId == viewId;
-        const auto* bufferedPreviousAnimation =
-            g_authoritativeCameraBufferActive
-            ? FindProducedEntityAnimation(
-                  *tracked, g_cameraPreviousProductionSequence)
-            : nullptr;
-        const auto* bufferedCurrentAnimation =
-            g_authoritativeCameraBufferActive
-            ? FindProducedEntityAnimation(
-                  *tracked, g_cameraCurrentProductionSequence)
-            : nullptr;
-        const bool bufferedAnimationAvailable =
-            bufferedPreviousAnimation != nullptr &&
-            bufferedCurrentAnimation != nullptr &&
-            bufferedPreviousAnimation->joints.size() ==
-                bufferedCurrentAnimation->joints.size();
-        const auto* latestBufferedAnimation = bufferedAnimationAvailable
-            ? FindLatestProducedEntityAnimation(*tracked)
-            : nullptr;
-        const bool bufferedAnimationChanged =
-            bufferedAnimationAvailable &&
-            !JointMatricesEqual(bufferedPreviousAnimation->joints,
-                                bufferedCurrentAnimation->joints);
-        const bool bufferedAnimationInterpolatable =
-            bufferedAnimationChanged &&
-            (tracked->allowViewId == 0 ||
-             !ViewModelJointPoseDiscontinuous(
-                 bufferedPreviousAnimation->joints,
-                 bufferedCurrentAnimation->joints));
-        const bool bufferedAnimationNeedsPresentation =
-            bufferedAnimationAvailable &&
-            BufferedEntityHistoryNeedsPresentation(
-                bufferedAnimationChanged,
-                bufferedAnimationInterpolatable,
-                latestBufferedAnimation != nullptr
-                    ? latestBufferedAnimation->sequence
-                    : 0,
-                g_cameraCurrentProductionSequence);
-        const bool currentAnimation = !g_authoritativeCameraBufferActive &&
-            tracked->animation.canInterpolate &&
+        const bool currentAnimation = tracked->animation.canInterpolate &&
             tracked->animation.transitionGeneration ==
                 g_cameraSnapshotGeneration;
-        const bool pendingAnimation = !g_authoritativeCameraBufferActive &&
-            g_overdueSnapshotFallbackRequested &&
+        const bool pendingAnimation = g_overdueSnapshotFallbackRequested &&
             tracked->animation.canInterpolate &&
             tracked->animation.transitionGeneration ==
                 g_cameraSnapshotGeneration + 1;
         const bool applyAnimation = animationRequested &&
             animationMatchesView && cameraInterpolated &&
             tracked->animation.hasCurrent &&
-            (g_authoritativeCameraBufferActive
-                 ? bufferedAnimationNeedsPresentation
-                 : currentAnimation || pendingAnimation);
+            (currentAnimation || pendingAnimation);
         const bool restoreAnimationCache = animationRequested &&
             animationMatchesView &&
             tracked->animation.cacheWasInterpolated && !applyAnimation;
@@ -2897,22 +2686,25 @@ std::size_t ApplyInterpolatedRenderEntities(
         }
         const void* liveConst = g_getRenderEntity(g_renderWorld, tracked->handle);
         if (liveConst == nullptr ||
+            !ValidateLiveRenderEntity(*tracked, liveConst) ||
             ReadUnaligned<int>(liveConst, kRenderEntityAllowViewIdOffset) !=
                 tracked->allowViewId) {
             continue;
         }
-        const ViewEntityPose livePose = ReadEntityPose(liveConst);
-        const auto expectedLiveMatrix = PoseToModelMatrix(livePose);
-        if (!ResolveRenderEntityModelMatrixOffset(liveConst,
-                                                  expectedLiveMatrix)) {
-            continue;
-        }
-        const auto* liveMatrix = static_cast<const std::uint8_t*>(liveConst) +
-            g_renderEntityModelMatrixOffset;
-        if (applyRoot &&
-            std::memcmp(liveMatrix, expectedLiveMatrix.data(),
-                        sizeof(expectedLiveMatrix)) != 0) {
-            continue;
+        const std::uint8_t* liveMatrix = nullptr;
+        if (applyRoot) {
+            const ViewEntityPose livePose = ReadEntityPose(liveConst);
+            const auto expectedLiveMatrix = PoseToModelMatrix(livePose);
+            if (!ResolveRenderEntityModelMatrixOffset(liveConst,
+                                                      expectedLiveMatrix)) {
+                continue;
+            }
+            liveMatrix = static_cast<const std::uint8_t*>(liveConst) +
+                g_renderEntityModelMatrixOffset;
+            if (std::memcmp(liveMatrix, expectedLiveMatrix.data(),
+                            sizeof(expectedLiveMatrix)) != 0) {
+                continue;
+            }
         }
         if (restoreAnimationCache) {
             if (ClearRenderEntityDynamicModel(liveConst)) {
@@ -2957,16 +2749,13 @@ std::size_t ApplyInterpolatedRenderEntities(
 
         if (applyRoot) {
             const bool useLatestTicAlpha =
-                !g_authoritativeCameraBufferActive &&
                 g_multiTicEntityAlignmentRequested &&
                 tracked->transitionSamples > 1;
-            const double rootAlpha = g_authoritativeCameraBufferActive
-                ? (bufferedPoseInterpolatable ? cameraAlpha : 1.0)
-                : EntityInterpolationAlpha(
-                      pendingPose, tracked->transitionSamples, cameraAlpha,
-                      latestTicAlpha, pendingTicAlpha,
-                      g_multiTicEntityAlignmentRequested,
-                      g_overdueSnapshotFallbackRequested);
+            const double rootAlpha = EntityInterpolationAlpha(
+                pendingPose, tracked->transitionSamples, cameraAlpha,
+                latestTicAlpha, pendingTicAlpha,
+                g_multiTicEntityAlignmentRequested,
+                g_overdueSnapshotFallbackRequested);
             if (pendingPose) {
                 if (viewModel) {
                     ++g_viewCounters.viewModelPendingRoots;
@@ -2981,19 +2770,8 @@ std::size_t ApplyInterpolatedRenderEntities(
                 }
             }
             ViewEntityPose interpolatedPose;
-            const ViewEntityPose& previousPose = useBufferedPose
-                ? bufferedPreviousPose->pose
-                : g_authoritativeCameraBufferActive
-                      ? livePose
-                      : tracked->previous;
-            const ViewEntityPose& currentPoseValue = useBufferedPose
-                ? bufferedCurrentPose->pose
-                : g_authoritativeCameraBufferActive
-                      ? livePose
-                      : tracked->current;
-            const bool interpolateBufferedOrCurrent = useBufferedPose
-                ? bufferedPoseInterpolatable
-                : !g_authoritativeCameraBufferActive && interpolatePose;
+            const ViewEntityPose& previousPose = tracked->previous;
+            const ViewEntityPose& currentPoseValue = tracked->current;
             for (std::size_t index = 0;
                  index < currentPoseValue.origin.size(); ++index) {
                 interpolatedPose.origin[index] = interpolatePose
@@ -3003,7 +2781,7 @@ std::size_t ApplyInterpolatedRenderEntities(
                            previousPose.origin[index]) * rootAlpha)
                     : currentPoseValue.origin[index];
             }
-            interpolatedPose.axis = interpolateBufferedOrCurrent
+            interpolatedPose.axis = interpolatePose
                 ? QuaternionToMatrix(
                       Slerp(MatrixToQuaternion(previousPose.axis),
                             MatrixToQuaternion(currentPoseValue.axis),
@@ -3027,17 +2805,13 @@ std::size_t ApplyInterpolatedRenderEntities(
         }
         if (applyAnimation) {
             const bool useLatestTicAlpha =
-                !g_authoritativeCameraBufferActive &&
                 g_multiTicEntityAlignmentRequested &&
                 tracked->animation.transitionSamples > 1;
-            const double animationAlpha = g_authoritativeCameraBufferActive
-                ? (bufferedAnimationInterpolatable ? cameraAlpha : 1.0)
-                : AnimationInterpolationAlpha(
-                      pendingAnimation,
-                      tracked->animation.transitionSamples,
-                      cameraAlpha, latestTicAlpha, pendingTicAlpha,
-                      g_multiTicEntityAlignmentRequested,
-                      g_overdueSnapshotFallbackRequested);
+            const double animationAlpha = AnimationInterpolationAlpha(
+                pendingAnimation, tracked->animation.transitionSamples,
+                cameraAlpha, latestTicAlpha, pendingTicAlpha,
+                g_multiTicEntityAlignmentRequested,
+                g_overdueSnapshotFallbackRequested);
             if (pendingAnimation) {
                 if (viewModel) {
                     ++g_viewCounters.viewModelPendingAnimations;
@@ -3051,14 +2825,7 @@ std::size_t ApplyInterpolatedRenderEntities(
                     ++g_viewCounters.worldLatestTicAnimations;
                 }
             }
-            if (bufferedAnimationAvailable) {
-                InterpolateJointMatrices(
-                    bufferedPreviousAnimation->joints,
-                    bufferedCurrentAnimation->joints,
-                    tracked->animation.interpolated, animationAlpha);
-            } else {
-                InterpolateJointMatrices(tracked->animation, animationAlpha);
-            }
+            InterpolateJointMatrices(tracked->animation, animationAlpha);
             saved.originalJoints = ReadUnaligned<void*>(
                 live, kRenderEntityJointsOffset);
             WriteUnaligned(live, kRenderEntityJointsOffset,
@@ -3085,103 +2852,6 @@ std::size_t ApplyInterpolatedRenderEntities(
     g_viewCounters.adjustedViewModels += adjustedViewModels;
     g_viewCounters.adjustedWorldEntities += adjustedWorldEntities;
     return count;
-}
-
-void AppendAnimatedWorldEntityTrace(
-    const std::array<AppliedViewEntityPose, kMaximumAppliedEntityPoses>& applied,
-    std::size_t appliedCount) {
-    if (!g_interpolationTraceRequested ||
-        !g_authoritativeCameraBufferActive ||
-        g_cameraCurrentProductionSequence == 0 ||
-        g_cameraCurrentProductionSequence ==
-            g_lastAnimatedWorldTraceSequence) {
-        return;
-    }
-    g_lastAnimatedWorldTraceSequence = g_cameraCurrentProductionSequence;
-
-    constexpr std::size_t maximumEntries = 24;
-    std::string entries;
-    std::size_t total = 0;
-    std::size_t emitted = 0;
-    for (std::size_t activeIndex = 0;
-         activeIndex < g_activeRenderEntityCount; ++activeIndex) {
-        auto* tracked = FindTrackedRenderEntity(
-            g_activeRenderEntityHandles[activeIndex]);
-        if (tracked == nullptr || tracked->allowViewId != 0 ||
-            !tracked->animation.hasCurrent) {
-            continue;
-        }
-        ++total;
-
-        const auto* previousAnimation = FindProducedEntityAnimation(
-            *tracked, g_cameraPreviousProductionSequence);
-        const auto* currentAnimation = FindProducedEntityAnimation(
-            *tracked, g_cameraCurrentProductionSequence);
-        const bool animationPair = previousAnimation != nullptr &&
-            currentAnimation != nullptr &&
-            previousAnimation->joints.size() ==
-                currentAnimation->joints.size();
-        const bool animationChanged = animationPair &&
-            !JointMatricesEqual(previousAnimation->joints,
-                                currentAnimation->joints);
-        const bool animationInterpolatable = animationChanged;
-
-        const auto* previousPose = FindProducedEntityPose(
-            *tracked, g_cameraPreviousProductionSequence);
-        const auto* currentPose = FindProducedEntityPose(
-            *tracked, g_cameraCurrentProductionSequence);
-        const bool rootPair = previousPose != nullptr &&
-            currentPose != nullptr;
-        const bool rootChanged = rootPair &&
-            std::memcmp(&previousPose->pose, &currentPose->pose,
-                        sizeof(previousPose->pose)) != 0;
-        const bool rootInterpolatable = rootChanged &&
-            PoseOriginDistance(previousPose->pose, currentPose->pose) <=
-                g_maximumWorldEntityStep &&
-            PoseAxisAngleDegrees(previousPose->pose, currentPose->pose) <=
-                g_maximumWorldEntityAngleDegrees;
-
-        bool animationApplied = false;
-        bool rootApplied = false;
-        for (std::size_t index = 0; index < appliedCount; ++index) {
-            if (applied[index].handle != tracked->handle) continue;
-            animationApplied = applied[index].jointsApplied;
-            rootApplied = applied[index].poseApplied;
-            break;
-        }
-
-        if (emitted >= maximumEntries) continue;
-        char entry[160]{};
-        const int length = _snprintf_s(
-            entry, sizeof(entry), _TRUNCATE,
-            "%sh=%d,e=%d,j=%zu,a=%d%d%d%d,r=%d%d%d%d",
-            emitted == 0 ? "" : ";", tracked->handle,
-            tracked->identity.entityNumber,
-            tracked->animation.current.size(), animationPair ? 1 : 0,
-            animationChanged ? 1 : 0,
-            animationInterpolatable ? 1 : 0,
-            animationApplied ? 1 : 0, rootPair ? 1 : 0,
-            rootChanged ? 1 : 0, rootInterpolatable ? 1 : 0,
-            rootApplied ? 1 : 0);
-        if (length > 0) {
-            entries.append(entry, static_cast<std::size_t>(length));
-            ++emitted;
-        }
-    }
-
-    char prefix[256]{};
-    const int prefixLength = _snprintf_s(
-        prefix, sizeof(prefix), _TRUNCATE,
-        "entity_interp_trace: sequence=%llu previous_sequence=%llu "
-        "world_animated=%zu emitted=%zu entries=",
-        static_cast<unsigned long long>(g_cameraCurrentProductionSequence),
-        static_cast<unsigned long long>(g_cameraPreviousProductionSequence),
-        total, emitted);
-    if (prefixLength <= 0) return;
-    std::string line(prefix, static_cast<std::size_t>(prefixLength));
-    line += entries;
-    line += "\r\n";
-    LogPresentationEvent(line);
 }
 
 void RestoreRenderEntities(
@@ -3240,14 +2910,6 @@ std::int64_t CameraIntervalQpc(std::int32_t milliseconds,
     return static_cast<std::int64_t>(std::llround(
         static_cast<double>(milliseconds) *
         static_cast<double>(frequency) / 1000.0));
-}
-
-bool ProducedCameraSampleReadyForAdvance(
-    std::int64_t sampleQpc, bool hasLookahead, std::int64_t nowQpc,
-    std::int64_t nativeIntervalQpc) {
-    return hasLookahead ||
-           (sampleQpc > 0 && nowQpc >= sampleQpc &&
-            nowQpc - sampleQpc >= nativeIntervalQpc);
 }
 
 std::int64_t AdvanceProducedCameraSnapshotClock(
@@ -3553,230 +3215,6 @@ void InterpolateCameraFov(
     }
 }
 
-std::optional<bool> BuildAuthoritativeBufferedView(
-    const void* presentationView,
-    std::array<std::uint8_t, kRenderViewSize>& temporary,
-    double& interpolationAlpha, double& latestTicAlpha,
-    double& pendingTicAlpha, double& basePitch, bool& basePitchValid,
-    std::int64_t nowQpc) {
-    if (!g_bufferedTwoTicInterpolationRequested ||
-        !g_continuousSnapshotTimingRequested ||
-        g_latestProducedCameraSequence < 2) {
-        g_authoritativeCameraBufferActive = false;
-        return std::nullopt;
-    }
-    const auto* latest = FindProducedCameraSnapshot(
-        g_latestProducedCameraSequence);
-    if (latest == nullptr ||
-        ReadUnaligned<std::int32_t>(latest->view.data(), 80) !=
-            ReadUnaligned<std::int32_t>(presentationView, 80) ||
-        ReadUnaligned<std::int32_t>(latest->view.data(), 0) !=
-            ReadUnaligned<std::int32_t>(presentationView, 0)) {
-        g_authoritativeCameraBufferActive = false;
-        g_cameraPreviousProductionSequence = 0;
-        g_cameraCurrentProductionSequence = 0;
-        g_cameraPreviousMouseSerial = 0;
-        g_cameraCurrentMouseSerial = 0;
-        return std::nullopt;
-    }
-
-    g_cameraFrameProbe = {};
-    g_cameraFrameProbe.qpc = nowQpc;
-    const std::int64_t nativeIntervalQpc = CameraIntervalQpc(
-        kNativeTicMilliseconds, g_frequency.QuadPart);
-    const auto initialize = [&]() -> bool {
-        const std::uint64_t currentSequence = latest->sequence - 1;
-        const auto* current = FindProducedCameraSnapshot(currentSequence);
-        const auto* previous = currentSequence > 1
-            ? FindProducedCameraSnapshot(currentSequence - 1)
-            : nullptr;
-        if (current == nullptr) return false;
-
-        g_cameraCurrent = current->view;
-        g_cameraPrevious = previous != nullptr
-            ? previous->view
-            : current->view;
-        g_cameraCurrentPitch = current->pitch;
-        g_cameraCurrentPitchValid = current->pitchValid;
-        g_cameraPreviousPitch = previous != nullptr
-            ? previous->pitch
-            : current->pitch;
-        g_cameraPreviousPitchValid = previous != nullptr
-            ? previous->pitchValid
-            : current->pitchValid;
-        g_cameraCurrentProductionSequence = currentSequence;
-        g_cameraPreviousProductionSequence = previous != nullptr
-            ? previous->sequence
-            : currentSequence;
-        g_cameraCurrentMouseSerial = current->mouseSerial;
-        g_cameraPreviousMouseSerial = previous != nullptr
-            ? previous->mouseSerial
-            : current->mouseSerial;
-        g_consumedCameraProductionSequence = currentSequence;
-        g_cameraCurrentQpc = latest->qpc;
-        g_cameraCurrentIntervalMilliseconds = kNativeTicMilliseconds;
-        g_haveCameraCurrent = true;
-        const std::uint32_t initialDiscontinuity = previous != nullptr
-            ? CameraSnapshotDiscontinuityMask(previous->view, current->view)
-            : 0;
-        const bool initialReset =
-            CameraSnapshotRequiresReset(initialDiscontinuity);
-        g_canInterpolateCamera = previous != nullptr && !initialReset;
-        if (initialReset) {
-            ClearProducedRenderEntityHistories();
-        }
-        g_cameraFrameProbe.fovInterpolated = previous != nullptr &&
-            !initialReset &&
-            (initialDiscontinuity & kCameraProbeFov) != 0;
-        g_cameraTimelineSynchronized = true;
-        g_cameraPhaseRecoveryActive = false;
-        g_cameraPhaseRecoveryCandidateQpc = 0;
-        g_authoritativeCameraBufferActive = true;
-        ++g_cameraSnapshotGeneration;
-        g_lastCameraCallQpc = nowQpc;
-        g_cameraFrameProbe.resetMask = kCameraProbeInitial;
-        g_cameraFrameProbe.viewTime = ReadUnaligned<std::int32_t>(
-            g_cameraCurrent.data(), 80);
-        g_cameraFrameProbe.producerBufferDepth = static_cast<std::uint32_t>(
-            latest->sequence - currentSequence);
-        ResetTrackedEntityInterpolation();
-        return true;
-    };
-
-    if (!g_authoritativeCameraBufferActive || !g_haveCameraCurrent) {
-        if (!initialize()) return std::nullopt;
-        basePitch = g_cameraCurrentPitch;
-        basePitchValid = g_cameraCurrentPitchValid;
-        ++g_viewCounters.snappedViews;
-        return false;
-    }
-
-    const std::int64_t previousCallQpc = g_lastCameraCallQpc;
-    const double callGapMilliseconds = previousCallQpc > 0
-        ? 1000.0 * static_cast<double>(nowQpc - previousCallQpc) /
-              static_cast<double>(g_frequency.QuadPart)
-        : 0.0;
-    g_lastCameraCallQpc = nowQpc;
-    g_cameraFrameProbe.callGapMilliseconds = callGapMilliseconds;
-    if (callGapMilliseconds > kMaximumCameraStallSeconds * 1000.0 ||
-        nowQpc - g_cameraCurrentQpc > 3 * nativeIntervalQpc) {
-        if (!initialize()) return std::nullopt;
-        g_cameraFrameProbe.resetMask |= kCameraProbeStall;
-        basePitch = g_cameraCurrentPitch;
-        basePitchValid = g_cameraCurrentPitchValid;
-        ++g_viewCounters.interpolationResets;
-        ++g_viewCounters.resetStall;
-        ++g_viewCounters.snappedViews;
-        return false;
-    }
-
-    const std::int64_t nextBoundaryQpc =
-        g_cameraCurrentQpc + nativeIntervalQpc;
-    const std::uint64_t nextSequence =
-        g_cameraCurrentProductionSequence + 1;
-    const auto* next = FindProducedCameraSnapshot(nextSequence);
-    if (nowQpc >= nextBoundaryQpc && next != nullptr) {
-        const std::uint32_t discontinuity =
-            CameraSnapshotDiscontinuityMask(g_cameraCurrent, next->view);
-        const auto* lookahead = FindProducedCameraSnapshot(
-            nextSequence + 1);
-        const bool nextReady = ProducedCameraSampleReadyForAdvance(
-            next->qpc, lookahead != nullptr, nowQpc, nativeIntervalQpc);
-        if (CameraSnapshotRequiresReset(discontinuity)) {
-            g_cameraPrevious = next->view;
-            g_cameraCurrent = next->view;
-            g_cameraPreviousPitch = next->pitch;
-            g_cameraCurrentPitch = next->pitch;
-            g_cameraPreviousPitchValid = next->pitchValid;
-            g_cameraCurrentPitchValid = next->pitchValid;
-            g_cameraPreviousProductionSequence = nextSequence;
-            g_cameraCurrentProductionSequence = nextSequence;
-            g_cameraPreviousMouseSerial = next->mouseSerial;
-            g_cameraCurrentMouseSerial = next->mouseSerial;
-            g_consumedCameraProductionSequence = nextSequence;
-            g_cameraCurrentQpc = lookahead != nullptr
-                ? lookahead->qpc
-                : nowQpc;
-            g_canInterpolateCamera = false;
-            g_cameraFrameProbe.resetMask = discontinuity;
-            ClearProducedRenderEntityHistories();
-            ResetTrackedEntityInterpolation();
-            ++g_viewCounters.interpolationResets;
-        } else if (nextReady) {
-            g_cameraPrevious = g_cameraCurrent;
-            g_cameraCurrent = next->view;
-            g_cameraPreviousPitch = g_cameraCurrentPitch;
-            g_cameraPreviousPitchValid = g_cameraCurrentPitchValid;
-            g_cameraCurrentPitch = next->pitch;
-            g_cameraCurrentPitchValid = next->pitchValid;
-            g_cameraPreviousProductionSequence =
-                g_cameraCurrentProductionSequence;
-            g_cameraCurrentProductionSequence = nextSequence;
-            g_cameraPreviousMouseSerial = g_cameraCurrentMouseSerial;
-            g_cameraCurrentMouseSerial = next->mouseSerial;
-            g_consumedCameraProductionSequence = nextSequence;
-            g_cameraCurrentQpc = nextBoundaryQpc;
-            if (lookahead != nullptr &&
-                g_cameraCurrentQpc > lookahead->qpc) {
-                g_cameraFrameProbe.producerEarlyClampQpc =
-                    g_cameraCurrentQpc - lookahead->qpc;
-                g_cameraCurrentQpc = lookahead->qpc;
-            }
-            g_canInterpolateCamera = true;
-            ++g_cameraSnapshotGeneration;
-            g_cameraFrameProbe.viewDelta = kNativeTicMilliseconds;
-            g_cameraFrameProbe.producerBufferAdvances = 1;
-            g_cameraFrameProbe.producerSettledAdvances =
-                lookahead == nullptr ? 1u : 0u;
-            g_cameraFrameProbe.fovInterpolated =
-                (discontinuity & kCameraProbeFov) != 0;
-        }
-    }
-
-    g_cameraFrameProbe.viewTime = ReadUnaligned<std::int32_t>(
-        g_cameraCurrent.data(), 80);
-    g_cameraFrameProbe.producerBufferDepth =
-        latest->sequence >= g_cameraCurrentProductionSequence
-            ? static_cast<std::uint32_t>(
-                  latest->sequence - g_cameraCurrentProductionSequence)
-            : 0;
-    if (!g_canInterpolateCamera) {
-        basePitch = g_cameraCurrentPitch;
-        basePitchValid = g_cameraCurrentPitchValid;
-        ++g_viewCounters.snappedViews;
-        return false;
-    }
-
-    const double alpha = CameraInterpolationAlphaForMode(
-        kNativeTicMilliseconds, nowQpc, g_cameraCurrentQpc,
-        g_frequency.QuadPart, false);
-    interpolationAlpha = alpha;
-    latestTicAlpha = alpha;
-    pendingTicAlpha = 0.0;
-    basePitchValid = g_cameraPreviousPitchValid &&
-                     g_cameraCurrentPitchValid;
-    if (basePitchValid) {
-        basePitch = g_cameraPreviousPitch +
-                    (g_cameraCurrentPitch - g_cameraPreviousPitch) * alpha;
-    }
-    std::memcpy(temporary.data(), presentationView, temporary.size());
-    InterpolateCameraFov(g_cameraPrevious, g_cameraCurrent, alpha,
-                         temporary.data());
-    const auto previousOrigin = ReadOrigin(g_cameraPrevious.data());
-    const auto currentOrigin = ReadOrigin(g_cameraCurrent.data());
-    for (std::size_t index = 0; index < previousOrigin.size(); ++index) {
-        WriteUnaligned(
-            temporary.data(), 28 + index * sizeof(float),
-            static_cast<float>(previousOrigin[index] +
-                (currentOrigin[index] - previousOrigin[index]) * alpha));
-    }
-    const auto matrix = QuaternionToMatrix(Slerp(
-        MatrixToQuaternion(ReadAxis(g_cameraPrevious.data())),
-        MatrixToQuaternion(ReadAxis(g_cameraCurrent.data())), alpha));
-    std::memcpy(temporary.data() + 40, matrix.data(), sizeof(matrix));
-    ++g_viewCounters.interpolatedViews;
-    return true;
-}
 
 bool BuildInterpolatedView(const void* view,
                            std::array<std::uint8_t, kRenderViewSize>& temporary,
@@ -3794,12 +3232,6 @@ bool BuildInterpolatedView(const void* view,
 
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
-    if (const auto buffered = BuildAuthoritativeBufferedView(
-            view, temporary, interpolationAlpha, latestTicAlpha,
-            pendingTicAlpha, basePitch, basePitchValid, now.QuadPart);
-        buffered.has_value()) {
-        return *buffered;
-    }
     const void* presentationView = view;
     const ProducedCameraSnapshot* producedCurrent = nullptr;
     const ProducedCameraSnapshot* producedPrevious = nullptr;
@@ -4223,27 +3655,6 @@ void AppendInterpolationTrace(
         const auto* tracked =
             FindTrackedRenderEntity(g_activeRenderEntityHandles[index]);
         if (tracked == nullptr) continue;
-        if (g_authoritativeCameraBufferActive) {
-            const auto* previousPose = FindProducedEntityPose(
-                *tracked, g_cameraPreviousProductionSequence);
-            const auto* currentPose = FindProducedEntityPose(
-                *tracked, g_cameraCurrentProductionSequence);
-            if (previousPose != nullptr && currentPose != nullptr) {
-                ++rootCurrent;
-            } else {
-                ++rootOther;
-            }
-            const auto* previousAnimation = FindProducedEntityAnimation(
-                *tracked, g_cameraPreviousProductionSequence);
-            const auto* currentAnimation = FindProducedEntityAnimation(
-                *tracked, g_cameraCurrentProductionSequence);
-            if (previousAnimation != nullptr && currentAnimation != nullptr) {
-                ++animationCurrent;
-            } else if (tracked->animation.hasCurrent) {
-                ++animationOther;
-            }
-            continue;
-        }
         if (tracked->hasCurrent && tracked->canInterpolate) {
             if (tracked->transitionGeneration == g_cameraSnapshotGeneration) {
                 ++rootCurrent;
@@ -4340,8 +3751,6 @@ void AppendInterpolationTrace(
         "snapshot_qpc=%lld snapshot_age_ms=%.4f interval_ms=%d "
         "generation=%llu reset_mask=0x%02x timeline_sync=%d "
         "producer_bridge_samples=%u producer_early_clamp_ms=%.4f "
-        "producer_buffer_depth=%u producer_buffer_advances=%u "
-        "producer_settled_advances=%u "
         "fov_interpolated=%d can_interpolate=%d "
         "camera_applied=%d effects_time_applied=%d mouse_applied=%d "
         "source_time=%d presented_time=%d "
@@ -4355,8 +3764,6 @@ void AppendInterpolationTrace(
         "mouse_peek=%d mouse_dx=%d mouse_dy=%d "
         "mouse_serial_latest=%llu mouse_serial_included_before=%llu "
         "mouse_serial_included_after=%llu mouse_serial_selected=%llu "
-        "mouse_buffered=%d mouse_buffer_previous_serial=%llu "
-        "mouse_buffer_current_serial=%llu "
         "viewmodel_handle=%d viewmodel_source_origin=%.4f,%.4f,%.4f "
         "viewmodel_presented_origin=%.4f,%.4f,%.4f "
         "applied_entities=%zu active_entities=%zu "
@@ -4392,9 +3799,6 @@ void AppendInterpolationTrace(
         g_cameraTimelineSynchronized ? 1 : 0,
         g_cameraFrameProbe.producerBridgeSamples,
         producerEarlyClampMilliseconds,
-        g_cameraFrameProbe.producerBufferDepth,
-        g_cameraFrameProbe.producerBufferAdvances,
-        g_cameraFrameProbe.producerSettledAdvances,
         g_cameraFrameProbe.fovInterpolated ? 1 : 0,
         g_canInterpolateCamera ? 1 : 0, cameraInterpolated ? 1 : 0,
         effectsTimeApplied ? 1 : 0, mouseOverlaid ? 1 : 0,
@@ -4414,11 +3818,6 @@ void AppendInterpolationTrace(
         static_cast<unsigned long long>(
             g_mouseFrameProbe.includedSerialAfter),
         static_cast<unsigned long long>(g_mouseFrameProbe.selectedSerial),
-        g_mouseFrameProbe.buffered ? 1 : 0,
-        static_cast<unsigned long long>(
-            g_mouseFrameProbe.bufferedPreviousSerial),
-        static_cast<unsigned long long>(
-            g_mouseFrameProbe.bufferedCurrentSerial),
         viewModelHandle, viewModelSourceOrigin[0], viewModelSourceOrigin[1],
         viewModelSourceOrigin[2], viewModelPresentedOrigin[0],
         viewModelPresentedOrigin[1], viewModelPresentedOrigin[2],
@@ -4469,21 +3868,12 @@ void AppendInterpolationTrace(
 void AppendCameraProductionTrace(const void* renderView,
                                  std::int64_t beginQpc,
                                  std::int64_t endQpc) {
-    ++g_cameraProductionProbe.calls;
-    const SelectedGameTicSnapshot selected = ReadSelectedGameTic();
-    const bool hadReadableView = g_cameraProductionProbe.readable;
-    const std::int32_t previousViewTime =
-        g_cameraProductionProbe.viewTime;
-    g_cameraProductionProbe.selectedGameTicSerial = selected.serial;
-    g_cameraProductionProbe.qpc = endQpc;
-    g_cameraProductionProbe.comTic = ReadComTicNumber();
-    g_cameraProductionProbe.readable =
-        IsReadableRange(renderView, kRenderViewSize);
-
+    const bool readable = IsReadableRange(renderView, kRenderViewSize);
     std::int32_t viewId = 0;
     std::array<float, 3> origin{};
     std::uint64_t producedMouseSerial = 0;
-    if (g_cameraProductionProbe.readable) {
+    std::int32_t viewTime = 0;
+    if (readable) {
         const std::uint64_t producedSequence =
             g_latestProducedCameraSequence + 1;
         auto& produced = g_producedCameraSnapshots[
@@ -4498,16 +3888,26 @@ void AppendCameraProductionTrace(const void* renderView,
         produced.pitchValid = ReadEffectivePitch(produced.pitch);
         g_latestProducedCameraSequence = producedSequence;
 
-        const std::int32_t viewTime =
-            ReadUnaligned<std::int32_t>(renderView, 80);
+        viewTime = ReadUnaligned<std::int32_t>(renderView, 80);
+    }
+
+    if (!g_interpolationTraceRequested || g_frequency.QuadPart <= 0) return;
+    ++g_cameraProductionProbe.calls;
+    const SelectedGameTicSnapshot selected = ReadSelectedGameTic();
+    const bool hadReadableView = g_cameraProductionProbe.readable;
+    const std::int32_t previousViewTime =
+        g_cameraProductionProbe.viewTime;
+    g_cameraProductionProbe.selectedGameTicSerial = selected.serial;
+    g_cameraProductionProbe.qpc = endQpc;
+    g_cameraProductionProbe.comTic = ReadComTicNumber();
+    g_cameraProductionProbe.readable = readable;
+    if (readable) {
         g_cameraProductionProbe.previousViewTime = previousViewTime;
         g_cameraProductionProbe.havePreviousViewTime = hadReadableView;
         g_cameraProductionProbe.viewTime = viewTime;
         viewId = ReadUnaligned<std::int32_t>(renderView, 0);
         origin = ReadOrigin(renderView);
     }
-
-    if (!g_interpolationTraceRequested || g_frequency.QuadPart <= 0) return;
     const double durationMicroseconds = 1'000'000.0 *
         static_cast<double>(endQpc - beginQpc) /
         static_cast<double>(g_frequency.QuadPart);
@@ -4548,7 +3948,9 @@ void AppendCameraProductionTrace(const void* renderView,
 
 void __fastcall HookedCalculateRenderView(void* self, void*) {
     LARGE_INTEGER begin{};
-    QueryPerformanceCounter(&begin);
+    if (g_interpolationTraceRequested) {
+        QueryPerformanceCounter(&begin);
+    }
     g_originalCalculateRenderView(self);
     LARGE_INTEGER end{};
     QueryPerformanceCounter(&end);
@@ -4592,7 +3994,6 @@ void __fastcall HookedSingleView(void* self, void*, void* hud, const void* view)
                                         latestTicAlpha, pendingTicAlpha,
                                         cameraInterpolated, mouseOverlay,
                                         g_appliedEntityPoses);
-    AppendAnimatedWorldEntityTrace(g_appliedEntityPoses, appliedCount);
     AppendInterpolationTrace(
         view, presentedView, cameraInterpolated, effectsTimeApplied,
         mouseOverlaid,
@@ -5660,8 +5061,11 @@ DWORD WINAPI HookedWaitForSingleObject(HANDLE object,
     }
 
     LARGE_INTEGER begin{};
-    QueryPerformanceCounter(&begin);
-    const std::int32_t comTicAtWaitEntry = ReadComTicNumber();
+    std::int32_t comTicAtWaitEntry = -1;
+    if (g_interpolationTraceRequested) {
+        QueryPerformanceCounter(&begin);
+        comTicAtWaitEntry = ReadComTicNumber();
+    }
     const DWORD result =
         g_originalWaitForSingleObject(object, timeoutMilliseconds);
     LARGE_INTEGER wake{};
@@ -5686,6 +5090,8 @@ DWORD WINAPI HookedWaitForSingleObject(HANDLE object,
         stabilizedAdvanceTics = UpdateStabilizedAsyncClock(
             wake.QuadPart, wakeMilliseconds, threadId);
     }
+
+    if (!g_interpolationTraceRequested) return result;
 
     const std::uint64_t sequence =
         g_asyncTimerTracePublished.load(std::memory_order_relaxed) + 1;
@@ -5900,7 +5306,7 @@ void ReportFrame() {
         g_mouseCounters.commandMisses.exchange(0);
     const auto mouseLedgerOverflows =
         g_mouseCounters.ledgerOverflows.exchange(0);
-    char buffer[3200]{};
+    char buffer[3600]{};
     const int length = _snprintf_s(buffer, sizeof(buffer), _TRUNCATE,
                                    "presentation: qpc_start=%lld qpc_end=%lld swaps=%llu "
                                    "seconds=%.6f rate=%.3f samples=%zu median_ms=%.4f "
@@ -5952,7 +5358,12 @@ void ReportFrame() {
                                    "viewmodel_pending_roots=%llu "
                                    "viewmodel_pending_anims=%llu "
                                    "world_pending_roots=%llu "
-                                   "world_pending_anims=%llu\r\n",
+                                   "world_pending_anims=%llu "
+                                   "entity_candidates=%zu "
+                                   "entity_candidate_max=%llu "
+                                   "entity_candidate_rebuilds=%llu "
+                                   "entity_candidate_source_scans=%llu "
+                                   "entity_candidate_visits=%llu\r\n",
                                    static_cast<long long>(g_reportStart),
                                    static_cast<long long>(now.QuadPart),
                                    static_cast<unsigned long long>(g_reportFrames), seconds,
@@ -6083,7 +5494,16 @@ void ReportFrame() {
                                    static_cast<unsigned long long>(
                                        g_viewCounters.worldPendingRoots),
                                    static_cast<unsigned long long>(
-                                       g_viewCounters.worldPendingAnimations));
+                                       g_viewCounters.worldPendingAnimations),
+                                   g_presentationCandidateCount,
+                                   static_cast<unsigned long long>(
+                                       g_viewCounters.maximumPresentationCandidates),
+                                   static_cast<unsigned long long>(
+                                       g_viewCounters.presentationCandidateRebuilds),
+                                   static_cast<unsigned long long>(
+                                       g_viewCounters.presentationCandidateSourceScans),
+                                   static_cast<unsigned long long>(
+                                       g_viewCounters.presentationCandidateVisits));
     if (!g_interpolationTraceBuffer.empty()) {
         Log(g_interpolationTraceBuffer);
         g_interpolationTraceBuffer.clear();
@@ -6210,9 +5630,6 @@ void ConfigureFromEnvironment() {
     g_overdueSnapshotFallbackRequested =
         ReadEnvironmentFlag(L"PREYHFR_OVERDUE_SNAPSHOT_FALLBACK") &&
         g_multiTicEntityAlignmentRequested;
-    g_bufferedTwoTicInterpolationRequested =
-        ReadEnvironmentFlag(L"PREYHFR_BUFFERED_TWO_TIC_INTERPOLATION") &&
-        g_continuousSnapshotTimingRequested;
     g_interpolationTraceRequested =
         ReadEnvironmentFlag(L"PREYHFR_INTERPOLATION_TRACE") &&
         g_cameraInterpolationRequested;
@@ -6250,9 +5667,6 @@ void ConfigureFromConfig(const preyhfr::Config& config) {
         config.multiTicEntityAlignment && config.continuousSnapshotTiming;
     g_overdueSnapshotFallbackRequested =
         config.overdueSnapshotFallback && g_multiTicEntityAlignmentRequested;
-    g_bufferedTwoTicInterpolationRequested =
-        config.bufferedTwoTicInterpolation &&
-        g_continuousSnapshotTimingRequested;
     g_interpolationTraceRequested =
         config.interpolationTrace && config.cameraInterpolation;
     if (g_interpolationTraceRequested) {
@@ -6368,7 +5782,6 @@ bool InstallConfiguredHooks(unsigned int cap) {
                                    "mouse_interp=%s; continuous_snapshot_timing=%s; "
                                    "multi_tic_entity_alignment=%s; "
                                    "overdue_snapshot_fallback=%s; "
-                                   "buffered_two_tic_interpolation=%s; "
                                    "interpolation_trace=%s; "
                                    "timeline_reset_vk=0x%02x; "
                                    "borderless=%s; "
@@ -6398,9 +5811,6 @@ bool InstallConfiguredHooks(unsigned int cap) {
                                    g_overdueSnapshotFallbackRequested
                                        ? "enabled"
                                        : "disabled",
-                                   g_bufferedTwoTicInterpolationRequested
-                                       ? "enabled"
-                                       : "disabled",
                                    g_interpolationTraceRequested
                                        ? "enabled"
                                        : "disabled",
@@ -6415,10 +5825,6 @@ bool InstallConfiguredHooks(unsigned int cap) {
             "fov:0x10,stall:0x20,origin:0x40,axis:0x80,"
             "clock_debt:0x100; "
             "one interp_trace record is emitted per gameplay presentation\r\n");
-        Log("entity_interp_trace_schema: one record per producer interval; "
-            "entry fields h=render handle,e=entity number,j=joint count,"
-            "a=animation pair/changed/interpolatable/applied,"
-            "r=root pair/changed/interpolatable/applied; at most 24 entries\r\n");
         Log("async_timer_trace_schema: one record per 16 ms async timer wake; "
             "previous_callback_us covers engine Async work and lock delay; "
             "previous_emitted_tics is observed at the following wait entry\r\n");
@@ -7428,146 +6834,56 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
         return bridgeQpc == 30'500'000 && earlyClampQpc == 1'500'000;
     };
 
-    const auto testAuthoritativeTwoTicBuffer = [] {
-        struct Arrival {
-            std::int64_t milliseconds;
-            std::uint64_t sequence;
-        };
-        // Sample 5 is one native tick late and arrives in a pair with sample 6.
-        // The delayed playhead must consume only sample 5 at 80 ms, retain
-        // sample 6, and never enter extrapolation or jump presentation time.
-        constexpr std::array<Arrival, 7> arrivals{{
-            {0, 1}, {16, 2}, {32, 3}, {48, 4},
-            {80, 5}, {80, 6}, {112, 7},
-        }};
-        constexpr std::int64_t testFrequency = 1000;
-        constexpr std::int64_t nativeIntervalQpc =
-            kNativeTicMilliseconds;
-        if (ProducedCameraSampleReadyForAdvance(
-                80, false, 80, nativeIntervalQpc) ||
-            ProducedCameraSampleReadyForAdvance(
-                80, false, 95, nativeIntervalQpc) ||
-            !ProducedCameraSampleReadyForAdvance(
-                80, true, 80, nativeIntervalQpc) ||
-            !ProducedCameraSampleReadyForAdvance(
-                80, false, 96, nativeIntervalQpc)) {
-            return false;
-        }
-        std::size_t arrivalIndex = 0;
-        std::uint64_t latestSequence = 0;
-        std::uint64_t previousSequence = 0;
-        std::uint64_t currentSequence = 0;
-        std::int64_t currentBoundary = 0;
-        bool initialized = false;
-        bool verifiedPairDepth = false;
-        double lastPresented = 0.0;
-        for (std::int64_t now = 0; now <= 112; ++now) {
-            while (arrivalIndex < arrivals.size() &&
-                   arrivals[arrivalIndex].milliseconds <= now) {
-                latestSequence = arrivals[arrivalIndex].sequence;
-                ++arrivalIndex;
-            }
-            if (!initialized && latestSequence >= 2) {
-                currentSequence = latestSequence - 1;
-                previousSequence = currentSequence;
-                currentBoundary = now;
-                initialized = true;
-            } else if (initialized &&
-                       now >= currentBoundary + kNativeTicMilliseconds &&
-                       currentSequence < latestSequence) {
-                const std::uint64_t nextSequence = currentSequence + 1;
-                std::int64_t nextArrival = -1;
-                for (const auto& arrival : arrivals) {
-                    if (arrival.sequence == nextSequence) {
-                        nextArrival = arrival.milliseconds;
-                        break;
-                    }
-                }
-                const bool hasLookahead =
-                    latestSequence > nextSequence;
-                if (ProducedCameraSampleReadyForAdvance(
-                        nextArrival, hasLookahead, now,
-                        nativeIntervalQpc)) {
-                    previousSequence = currentSequence;
-                    ++currentSequence;
-                    currentBoundary += kNativeTicMilliseconds;
-                }
-            }
-            if (!initialized) continue;
-            const double alpha = CameraInterpolationAlphaForMode(
-                kNativeTicMilliseconds, now, currentBoundary,
-                testFrequency, false);
-            if (alpha < 0.0 || alpha > 1.0) return false;
-            const double presented =
-                static_cast<double>(previousSequence) *
-                    kNativeTicMilliseconds +
-                static_cast<double>(currentSequence - previousSequence) *
-                    kNativeTicMilliseconds * alpha;
-            if (now > 32 &&
-                (presented < lastPresented ||
-                 presented - lastPresented > 1.000001)) {
-                return false;
-            }
-            if (now == 80) {
-                verifiedPairDepth = latestSequence == 6 &&
-                    currentSequence == 5 &&
-                    latestSequence - currentSequence == 1 &&
-                    std::abs(presented - 64.0) < 0.000001;
-            }
-            lastPresented = presented;
-        }
-        return verifiedPairDepth;
+    const auto testPresentationCandidateSelection = [] {
+        const bool savedViewModel = g_viewModelInterpolationRequested;
+        const bool savedViewModelAnimation =
+            g_viewModelAnimationInterpolationRequested;
+        const bool savedWorld = g_worldInterpolationRequested;
+        const bool savedWorldAnimation =
+            g_worldAnimationInterpolationRequested;
+        const bool savedMouse = g_mouseInterpolationRequested;
+        const std::uint64_t savedGeneration = g_cameraSnapshotGeneration;
+
+        g_viewModelInterpolationRequested = true;
+        g_viewModelAnimationInterpolationRequested = true;
+        g_worldInterpolationRequested = true;
+        g_worldAnimationInterpolationRequested = true;
+        g_mouseInterpolationRequested = true;
+        g_cameraSnapshotGeneration = 100;
+
+        TrackedRenderEntity tracked;
+        tracked.handle = 1;
+        tracked.hasCurrent = true;
+        bool passed = !IsPresentationCandidate(tracked);
+        tracked.canInterpolate = true;
+        tracked.transitionGeneration = 100;
+        passed = passed && IsPresentationCandidate(tracked);
+        tracked.transitionGeneration = 101;
+        passed = passed && IsPresentationCandidate(tracked);
+        tracked.transitionGeneration = 102;
+        passed = passed && !IsPresentationCandidate(tracked);
+        tracked.canInterpolate = false;
+        tracked.animation.hasCurrent = true;
+        tracked.animation.canInterpolate = true;
+        tracked.animation.transitionGeneration = 100;
+        passed = passed && IsPresentationCandidate(tracked);
+        tracked.animation.canInterpolate = false;
+        tracked.animation.cacheWasInterpolated = true;
+        passed = passed && IsPresentationCandidate(tracked);
+        tracked.animation.cacheWasInterpolated = false;
+        tracked.allowViewId = 1;
+        passed = passed && IsPresentationCandidate(tracked);
+
+        g_viewModelInterpolationRequested = savedViewModel;
+        g_viewModelAnimationInterpolationRequested =
+            savedViewModelAnimation;
+        g_worldInterpolationRequested = savedWorld;
+        g_worldAnimationInterpolationRequested = savedWorldAnimation;
+        g_mouseInterpolationRequested = savedMouse;
+        g_cameraSnapshotGeneration = savedGeneration;
+        return passed;
     };
 
-    const auto testBufferedMouseLateLatch = [] {
-        const auto close = [](double left, double right) {
-            return std::abs(left - right) < 0.000001;
-        };
-        // The camera interpolation has already presented alpha of the input
-        // between its two snapshots.  Only the remainder of that interval is
-        // replayed, while input newer than the current snapshot is always
-        // applied in full.
-        const auto quarter = ComposeBufferedMouseOverlay(
-            8.0, -4.0, 3.0, 2.0, 0.25);
-        const auto start = ComposeBufferedMouseOverlay(
-            8.0, -4.0, 3.0, 2.0, 0.0);
-        const auto end = ComposeBufferedMouseOverlay(
-            8.0, -4.0, 3.0, 2.0, 1.0);
-        const auto clampedLow = ComposeBufferedMouseOverlay(
-            8.0, -4.0, 3.0, 2.0, -1.0);
-        const auto clampedHigh = ComposeBufferedMouseOverlay(
-            8.0, -4.0, 3.0, 2.0, 2.0);
-        return close(quarter[0], 9.0) && close(quarter[1], -1.0) &&
-               close(start[0], 11.0) && close(start[1], -2.0) &&
-               close(end[0], 3.0) && close(end[1], 2.0) &&
-               close(clampedLow[0], start[0]) &&
-               close(clampedLow[1], start[1]) &&
-               close(clampedHigh[0], end[0]) &&
-               close(clampedHigh[1], end[1]);
-    };
-
-    const auto testBufferedEntityEligibility = [] {
-        // A static or repeatedly submitted unchanged state must not make an
-        // entity eligible forever merely because it is the nearest older
-        // sample.  A changed pair is interpolated, while an unchanged older
-        // state is still held when a newer future sample proves the live
-        // entity is ahead of the delayed playhead.
-        const bool staticSample = BufferedEntityHistoryNeedsPresentation(
-            false, false, 10, 100);
-        const bool unchangedCurrent =
-            BufferedEntityHistoryNeedsPresentation(false, false, 100, 100);
-        const bool changedPair = BufferedEntityHistoryNeedsPresentation(
-            true, true, 100, 100);
-        const bool delayedFuture = BufferedEntityHistoryNeedsPresentation(
-            false, false, 101, 100);
-        const bool discontinuityAtLive =
-            BufferedEntityHistoryNeedsPresentation(true, false, 100, 100);
-        const bool discontinuityAhead =
-            BufferedEntityHistoryNeedsPresentation(true, false, 101, 100);
-        return !staticSample && !unchangedCurrent && changedPair &&
-               delayedFuture && !discontinuityAtLive &&
-               discontinuityAhead;
-    };
 
     const auto testSustainedPhaseRecovery = [] {
         // Reproduce the captured rollback geometry, then keep the observed
@@ -7633,28 +6949,23 @@ extern "C" __declspec(dllexport) BOOL WINAPI PreyHFRTestInterpolationCadence() {
     const bool overdue360Passed = testOverdue360();
     const bool batchedPhasePassed = testBatchedPhaseExcursion();
     const bool earlyProducerPassed = testEarlyProducerClamp();
-    const bool authoritativeBufferPassed = testAuthoritativeTwoTicBuffer();
-    const bool bufferedMousePassed = testBufferedMouseLateLatch();
-    const bool bufferedEntityPassed = testBufferedEntityEligibility();
+    const bool presentationCandidatesPassed =
+        testPresentationCandidateSelection();
     const bool sustainedPhasePassed = testSustainedPhaseRecovery();
     if (!featureGatesPassed || !rate120Passed || !rate60Passed ||
         !overdue360Passed || !batchedPhasePassed ||
-        !earlyProducerPassed || !authoritativeBufferPassed ||
-        !bufferedMousePassed || !bufferedEntityPassed ||
+        !earlyProducerPassed || !presentationCandidatesPassed ||
         !sustainedPhasePassed) {
-        char line[288]{};
+        char line[336]{};
         const int length = _snprintf_s(
             line, sizeof(line), _TRUNCATE,
             "test: interpolation cadence failed; features=%d rate120=%d "
             "rate60=%d overdue360=%d batched_phase=%d early_producer=%d "
-            "authoritative_buffer=%d buffered_mouse=%d "
-            "buffered_entity=%d sustained_phase=%d\r\n",
+            "presentation_candidates=%d sustained_phase=%d\r\n",
             featureGatesPassed ? 1 : 0, rate120Passed ? 1 : 0,
             rate60Passed ? 1 : 0, overdue360Passed ? 1 : 0,
             batchedPhasePassed ? 1 : 0, earlyProducerPassed ? 1 : 0,
-            authoritativeBufferPassed ? 1 : 0,
-            bufferedMousePassed ? 1 : 0,
-            bufferedEntityPassed ? 1 : 0,
+            presentationCandidatesPassed ? 1 : 0,
             sustainedPhasePassed ? 1 : 0);
         if (length > 0) Log(std::string(line, static_cast<std::size_t>(length)));
         return FALSE;

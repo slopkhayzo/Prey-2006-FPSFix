@@ -111,13 +111,6 @@ combined with exclusive mode.
 The interpolation.effects setting controls presentation-rate renderer particle
 and material time. It does not advance gameplay FX, scripts, or simulation.
 
-The compatibility.buffered_two_tic_interpolation setting defaults to false.
-Enabling it keeps one completed native simulation tic buffered to tolerate
-irregular producer delivery, at the cost of one native tic of positional
-presentation latency. The normal lower-latency interpolation path is preferred
-now that PreyHFR stabilizes the game's asynchronous tic clock directly.
-
-
 SUPPORTED GAME VERSION
 ----------------------
 
